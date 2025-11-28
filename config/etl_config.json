@@ -1,0 +1,27 @@
+{
+  "mode": "daily",
+  "app_ids": [
+    "1234567890",
+    "0987654321"
+  ],
+  "start_date": "2024-11-18",
+  "end_date": "2024-11-25",
+  "s3_bucket": "apple-analytics-pipeline", 
+  "registry_file": "/Users/ankit_chauhan/Desktop/PlayGroundS/Download_Pipeline/Apple-Analytics/config/request_registry.json",
+  "log_level": "INFO",
+  "log_to_file": true,
+  "athena_settings": {
+    "databases": ["curated", "appstore"],
+    "workgroup": "primary",
+    "query_timeout": 300
+  },
+  "scheduling": {
+    "daily_run_time": "06:00",
+    "retry_attempts": 3,
+    "retry_delay_minutes": 15
+  },
+  "notifications": {
+    "slack_webhook": null,
+    "email_alerts": []
+  }
+}

@@ -1,241 +1,400 @@
-here’s a crisp set of **copy-pasteable flow charts** for everything we planned for the analytics dashboard—data in, curation, querying, and the business views.
+# Apple Analytics ETL Pipeline
+
+> **Last Updated:** 2025-11-28  
+> **Status:** ✅ Production Ready
+
+A complete ETL pipeline for extracting Apple App Store Connect Analytics data and loading it into AWS Athena for business intelligence and dashboards.
 
 ---
 
-## 1) System overview (context)
+## Table of Contents
 
+1. [Quick Start](#quick-start)
+2. [Architecture Overview](#architecture-overview)
+3. [Implementation Status](#implementation-status)
+4. [Project Structure](#project-structure)
+5. [Data Flow](#data-flow)
+6. [Usage Guide](#usage-guide)
+7. [Athena Tables](#athena-tables)
+8. [Configuration](#configuration)
+9. [Troubleshooting](#troubleshooting)
+
+---
+
+## Quick Start
+
+```bash
+# 1. Activate virtual environment
+cd /Users/ankit_chauhan/Desktop/PlayGroundS/Download_Pipeline/Apple-Analytics
+source ../.venv/bin/activate
+
+# 2. Run daily ETL (extracts yesterday's data)
+python3 daily_etl.py
+
+# 3. Or run for a specific app/date
+python3 daily_etl.py --app-id 1506886061 --date 2025-11-26
+```
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        APPLE ANALYTICS ETL PIPELINE                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
+│  │ Apple API    │───▶│ Extract      │───▶│ Transform    │───▶│ Load      │ │
+│  │ (ASC)        │    │ (Raw → S3)   │    │ (Curate)     │    │ (Athena)  │ │
+│  └──────────────┘    └──────────────┘    └──────────────┘    └───────────┘ │
+│         │                   │                   │                   │       │
+│         ▼                   ▼                   ▼                   ▼       │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
+│  │ Analytics    │    │ s3://bucket/ │    │ s3://bucket/ │    │ Athena    │ │
+│  │ Sales API    │    │ appstore/raw │    │ appstore/    │    │ Tables    │ │
+│  │ Reviews API  │    │              │    │ curated/     │    │           │ │
+│  └──────────────┘    └──────────────┘    └──────────────┘    └───────────┘ │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Implementation Status
+
+### ✅ Implemented Features
+
+| Feature | Status | File |
+|---------|--------|------|
+| **ONGOING Request Support** | ✅ Done | `src/extract/apple_analytics_client.py` |
+| **ONE_TIME_SNAPSHOT Backfill** | ✅ Done | `src/extract/apple_analytics_client.py` |
+| **S3 Registry (avoid 409s)** | ✅ Done | `src/extract/apple_analytics_client.py` |
+| **Daily ETL Script** | ✅ Done | `daily_etl.py` |
+| **Downloads Extraction** | ✅ Done | `src/extract/focused_data_extractor.py` |
+| **Engagement Extraction** | ✅ Done | `src/extract/focused_data_extractor.py` |
+| **Sales & Trends API** | ✅ Done | `src/extract/apple_analytics_client.py` |
+| **Data Curation (Parquet)** | ✅ Done | `src/transform/apple_analytics_data_curator_production.py` |
+| **Athena Table Manager** | ✅ Done | `src/load/athena_table_manager_production.py` |
+| **JWT Auto-Refresh** | ✅ Done | `src/extract/apple_analytics_client.py` |
+| **Error Handling & Retry** | ✅ Done | All modules |
+
+### 📊 Data Available in Athena
+
+| Database | Table | Rows | Status |
+|----------|-------|------|--------|
+| `appstore` | `appstore_downloads` | 17M+ | ✅ Fresh |
+| `appstore` | `appstore_engagement` | 29M+ | ✅ Fresh |
+| `appstore` | `raw_installs` | Available | ✅ |
+| `appstore` | `raw_sessions` | Available | ✅ |
+| `appstore` | `raw_purchases` | Available | ✅ |
+| `curated` | `downloads` | Available | ✅ |
+| `curated` | `engagement` | Available | ✅ |
+| `curated` | `purchases` | Available | ✅ |
+| `curated` | `search_terms` | Available | ✅ |
+| `curated` | `deletions` | Available | ✅ |
+
+### 🔄 Planned But Not Yet Implemented
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Reviews Sentiment Analysis | ⏳ Planned | Topic clustering needed |
+| QuickSight Dashboard | ⏳ Planned | Can use Athena directly |
+| Alerting (Stale Data) | ⏳ Planned | CloudWatch integration |
+| Airflow DAG Integration | ✅ Ready | `airflow/dags/apple_ingestion.py` exists |
+
+---
+
+## Project Structure
+
+```
+Apple-Analytics/
+├── daily_etl.py                 # 🚀 Main daily ETL script (ONGOING requests)
+├── run_daily_etl.sh             # Shell wrapper for cron jobs
+├── production_manager.py        # Production orchestration
+├── complete_etl_health_check.py # Health check script
+│
+├── src/
+│   ├── extract/
+│   │   ├── apple_analytics_client.py      # Apple API client (JWT, requests)
+│   │   ├── focused_data_extractor.py      # Report extraction logic
+│   │   └── apple_request_status_checker.py
+│   │
+│   ├── transform/
+│   │   └── apple_analytics_data_curator_production.py  # CSV → Parquet
+│   │
+│   ├── load/
+│   │   └── athena_table_manager_production.py  # Athena DDL management
+│   │
+│   └── orchestration/
+│       └── unified_production_etl.py       # Full ETL orchestration
+│
+├── config/                      # Configuration templates
+├── logs/                        # ETL execution logs
+├── data/                        # Local data cache
+└── archive/                     # Old verification scripts
+```
+
+---
+
+## Data Flow
+
+### Daily ETL Flow (ONGOING Requests)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Daily ETL Flow                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. Check S3 Registry for existing ONGOING request              │
+│     └── s3://skidos-apptrack/analytics_requests/registry/       │
+│                                                                 │
+│  2. If not found → Query Apple API                              │
+│     └── GET /apps/{app_id}/analyticsReportRequests              │
+│         ?filter[accessType]=ONGOING                             │
+│                                                                 │
+│  3. If still not found → Create new ONGOING request             │
+│     └── POST /analyticsReportRequests                           │
+│         {"accessType": "ONGOING"}                               │
+│                                                                 │
+│  4. Save request_id to S3 registry for next time                │
+│                                                                 │
+│  5. Traverse: Reports → Instances → Segments → Files            │
+│                                                                 │
+│  6. Download CSV files to S3                                    │
+│     └── s3://skidos-apptrack/appstore/raw/{type}/dt=.../        │
+│                                                                 │
+│  7. Transform to Parquet (optional)                             │
+│     └── s3://skidos-apptrack/appstore/curated/{type}/           │
+│                                                                 │
+│  8. Query via Athena                                            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### S3 Directory Structure
+
+```
+s3://skidos-apptrack/
+├── appstore/
+│   ├── raw/
+│   │   ├── downloads/dt=2025-11-27/app_id=1506886061/
+│   │   ├── engagement/dt=2025-11-27/app_id=1506886061/
+│   │   ├── installs/dt=2025-11-27/app_id=1506886061/
+│   │   └── sessions/dt=2025-11-27/app_id=1506886061/
+│   │
+│   ├── raw_sales/SALES/DAILY/reportDate=2025-11-27/
+│   │
+│   └── curated/
+│       ├── downloads/dt=2025-11-27/app_id=1506886061/
+│       └── engagement/dt=2025-11-27/app_id=1506886061/
+│
+└── analytics_requests/
+    └── registry/
+        └── app_id=1506886061/
+            └── ongoing.json   # Cached request ID
+```
+
+---
+
+## Usage Guide
+
+### Daily Automated Extraction
+
+```bash
+# Run for all apps (92 configured)
+python3 daily_etl.py
+
+# Run for specific app
+python3 daily_etl.py --app-id 1506886061
+
+# Run for specific date
+python3 daily_etl.py --date 2025-11-26
+
+# Via shell script (for cron)
+./run_daily_etl.sh
+```
+
+### Cron Job Setup
+
+```bash
+# Add to crontab - runs at 4 PM UTC daily (after Apple data is available)
+0 16 * * * cd /path/to/Apple-Analytics && ./run_daily_etl.sh >> /var/log/apple_etl.log 2>&1
+```
+
+### Health Check
+
+```bash
+python3 complete_etl_health_check.py
+```
+
+### Query Data in Athena
+
+```sql
+-- Check downloads for an app
+SELECT metric_date, total_downloads, first_time_downloads
+FROM appstore.appstore_downloads
+WHERE app_apple_id = 1506886061
+ORDER BY metric_date DESC
+LIMIT 10;
+
+-- Check engagement metrics
+SELECT metric_date, impressions, product_page_views
+FROM appstore.appstore_engagement
+WHERE app_apple_id = 1506886061
+ORDER BY metric_date DESC
+LIMIT 10;
+```
+
+---
+
+## Athena Tables
+
+### Database: `appstore` (Raw Data)
+
+| Table | Description | Key Columns |
+|-------|-------------|-------------|
+| `appstore_downloads` | Daily download metrics | `app_apple_id`, `metric_date`, `total_downloads`, `first_time_downloads` |
+| `appstore_engagement` | Impressions & page views | `app_apple_id`, `metric_date`, `impressions`, `product_page_views` |
+| `raw_installs` | Install/deletion events | `app_id`, `date`, `installs`, `deletions` |
+| `raw_sessions` | App session metrics | `app_id`, `date`, `sessions`, `active_devices` |
+| `raw_purchases` | In-app purchases | `app_id`, `sku`, `units`, `proceeds` |
+
+### Database: `curated` (Processed Data)
+
+| Table | Description | Key Columns |
+|-------|-------------|-------------|
+| `downloads` | Curated downloads | `app_id`, `metric_date`, `country`, `platform` |
+| `engagement` | Curated engagement | `app_id`, `metric_date`, `source_type`, `page_type` |
+| `purchases` | Curated purchases | `app_id`, `sku`, `report_date`, `units`, `revenue` |
+| `search_terms` | ASO search data | `app_id`, `search_term`, `impressions` |
+| `deletions` | App deletions | `app_id`, `metric_date`, `deletions` |
+
+---
+
+## Configuration
+
+### Environment Variables (`.env`)
+
+```bash
+# Apple App Store Connect
+ASC_ISSUER_ID=your-issuer-id
+ASC_KEY_ID=your-key-id
+ASC_P8_PATH=/path/to/AuthKey.p8
+
+# Vendor & Apps
+APPLE_VENDOR_NUMBER=85875515
+APP_IDS=1506886061,1159612010,1468754350,...
+
+# AWS
+AWS_REGION=us-east-1
+S3_BUCKET=skidos-apptrack
+S3_PREFIX=appstore/
+
+# Athena
+GLUE_DB=appstore
+ATHENA_WORKGROUP=primary
+ATHENA_OUTPUT=s3://skidos-apptrack/Athena-Output/
+```
+
+### Apps Configured
+
+Currently **92 apps** are configured in `APP_IDS`. Key apps include:
+- `1506886061` - Doctor Games for Kids (17M+ downloads)
+- `1159612010` - Another high-volume app
+- `1468754350` - Chess for Kids
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| 409 Conflict | Request already exists | Use ONGOING requests (fixed!) |
+| 401 Unauthorized | JWT expired | Auto-refresh handles this |
+| 403 Forbidden | No permission to list requests | Registry fallback works |
+| Timeout errors | Apple API slow | Increase timeout, retry |
+| No data for date | Data not yet published | Apple publishes ~2 days late |
+
+### Logs
+
+```bash
+# Check ETL logs
+tail -f logs/daily_etl_*.log
+
+# Check results
+cat daily_etl_results_*.json
+```
+
+### Verify S3 Registry
+
+```bash
+aws s3 cat s3://skidos-apptrack/analytics_requests/registry/app_id=1506886061/ongoing.json
+```
+
+---
+
+## Original Design Diagrams
+
+<details>
+<summary>Click to expand architecture diagrams</summary>
+
+### System Overview
 ```mermaid
 flowchart LR
-  A["Apple App Store Connect<br/>(Analytics + Sales APIs)"] -->|CSV/TSV.GZ| B["Raw S3<br/>appstore/raw + raw_sales"]
-  B --> C["Curators<br/>normalize -> cast -> aggregate"]
-  C -->|Parquet| D["Curated S3<br/>appstore/curated/*/dt=.../app_id=.../"]
-  D --> E["Athena/Glue<br/>(Partition Projection)"]
-  E --> F["Dashboards<br/>(QuickSight / Superset / Streamlit)"]
-  F --> G["Business Users"]
-
+  A["Apple App Store Connect"] -->|CSV/TSV.GZ| B["Raw S3"]
+  B --> C["Curators"]
+  C -->|Parquet| D["Curated S3"]
+  D --> E["Athena/Glue"]
+  E --> F["Dashboards"]
 ```
 
----
-
-## 2) ONE_TIME backfill (historical) – request → poll → land
-
+### ONGOING Daily Feed
 ```mermaid
 flowchart TD
-  A["Start Backfill<br/>(app_id list, date range)"] --> B["Chunk ranges <= 90 days"]
-  B --> C["Build Request Payload<br/>accessType=ONE_TIME_SNAPSHOT<br/>granularity=DAILY<br/>reports=[type]"]
-  C --> D["Submit analyticsReportRequests"]
-  D --> E{HTTP 2xx?}
-  E -- "no" --> E1["Log error JSON<br/>fix reportType/attributes"] --> C
-  E -- "yes" --> F["Poll request.instances.segments.files"]
-  F -->|"Download files"| G["Raw S3<br/>appstore/raw/analytics/<type>/dt=.../app_id=.../"]
-  G --> H{"New files in last 24h?"}
-  H -- "yes" --> F
-  H -- "no" --> I["Mark request window COMPLETE"]
-```
-
----
-
-## 3) ONGOING daily feed – rolling updates
-
-```mermaid
-flowchart TD
-  A["Create ONGOING request<br/>(granularity=DAILY)"] --> B["Daily Poller (cron)"]
-  B --> C["Check today's instance/segment files"]
-  C -- "available" --> D["Raw S3 ingest (by dt/app_id)"]
-  C -- "not yet" --> B
-  D --> E["Curate -> Parquet -> Curated S3"]
+  A["Create ONGOING request"] --> B["Daily Poller"]
+  B --> C["Check today's files"]
+  C -- "available" --> D["Raw S3 ingest"]
+  D --> E["Curate -> Parquet"]
   E --> F["Dashboards refresh"]
 ```
 
----
-
-## 4) Sales & Trends (purchases/units) pipeline
-
-```mermaid
-flowchart LR
-  A["Sales Reports API<br/>(salesReports)"] -->|filters: reportType, frequency, reportDate, vendorNumber| B["Downloader"]
-  B --> C["Raw S3<br/>appstore/raw_sales/SALES/freq/reportDate=YYYY-MM-DD"]
-  C --> D["Purchases Curator<br/>parse TSV -> normalize -> cast -> aggregate"]
-  D -->|Parquet| E["Curated S3<br/>appstore/curated/purchases/dt=report_date/"]
-  E --> F["Athena<br/>(curated.purchases)"]
-
-```
-
----
-
-## 5) Curation flow (common pattern, all analytics tables)
-
-```mermaid
-flowchart TD
-  A["Raw CSV/TSV (.gz)"] --> B["Header Normalize<br/>(semantic renames)"]
-  B --> C["Type Casting<br/>(Int64, Double, Date)"]
-  C --> D["Fill Missing & Keys<br/>(app_id, metric_date, country, ...)"]
-  D --> E["Aggregate / Dedupe<br/>(sum by keys)"]
-  E --> F["Write Parquet<br/>curated/<table>/dt=.../app_id=.../part-*.parquet"]
-
-```
-
----
-
-## 6) Athena readiness (projection + query hygiene)
-
-```mermaid
-flowchart LR
-  A["Curated S3<br/>(Hive-style partitions)"] --> B["DDL with Partition Projection<br/>dt format/range, app_id_part integer,<br/>storage.location.template matches S3"]
-  B --> C["Queries<br/>ALWAYS filter dt AND app_id_part,<br/>avoid SELECT *"]
-  C --> D["Fast planning, low scan bytes,<br/>stable dashboards"]
-
-```
-
----
-
-## 7) Dashboard UX flows (role-based)
-
-### 7a) Executive Overview (5-second health)
-
-```mermaid
-flowchart TD
-  A["Global Filters<br/>(Date, App, Platform, Country)"] --> B["KPI Tiles<br/>Impressions, PPV, FTD, TD, Revenue,<br/>CVRs IMP->PPV, PPV->FTD, IMP->FTD"]
-  B --> C["Trend Sparklines"]
-  B --> D["Delta vs previous period"]
-
-```
-
-### 7b) Acquisition & ASO
-
-```mermaid
-flowchart LR
-  A["Engagement Table"] --> B["Daily Funnel Chart<br/>Impressions -> PPV -> FTD -> TD"]
-  A --> C["Source x Page x Platform (bars)"]
-  A --> D["Top Countries (heatmap)"]
-  A --> E["Search Terms Leaderboard<br/>(Impressions, PPV, Term CVR)"]
-
-```
-
-### 7c) Monetization
-
-```mermaid
-flowchart LR
-  P["Purchases Table"] --> Q["Revenue Trend"]
-  P --> R["Units / Revenue by SKU"]
-  P --> S["Revenue per Download<br/>(join downloads)"]
-  P --> T["Country & Currency Mix"]
-
-```
-
-### 7d) Quality & Brand (Reviews)
-
-```mermaid
-flowchart LR
-  A["Reviews Table"] --> B["Rating Trend"]
-  A --> C["Topic Clusters + Sentiment"]
-  C --> D["Impact Overlay<br/>(CVR dips vs negative themes)"]
-
-```
-
-### 7e) Ops & Data Health
-
-```mermaid
-flowchart TD
-  A["Freshness Monitors<br/>(last dt per table)"] --> B["Alerts<br/>(no new files, poller failures)"]
-  B --> C["Runbooks Links"]
-  A --> D["Missing Partitions Radar"]
-
-```
-
----
-
-## 8) Drilldown navigation (from KPIs to root-cause)
-
-```mermaid
-flowchart LR
-  KPI["Tile spike/dip"] --> A["Which country/platform?"]
-  A --> B["Which source/page type?"]
-  B --> C["Which search terms?"]
-  C --> D["Which SKU / revenue segment?"]
-  D --> KPI
-
-```
-
----
-
-## 9) Data model map (high level)
-
+### Data Model
 ```mermaid
 classDiagram
   class engagement {
     +app_id: BIGINT
     +metric_date: DATE
     +impressions: BIGINT
-    +impressions_unique: BIGINT
     +product_page_views: BIGINT
-    +product_page_views_unique: BIGINT
     +source_type: STRING
-    +page_type: STRING
-    +platform: STRING
     +country: STRING
-    <<partition>> dt: STRING, app_id_part: BIGINT
   }
   class downloads {
     +app_id: BIGINT
     +metric_date: DATE
     +first_time_downloads: BIGINT
-    +redownloads: BIGINT
     +total_downloads: BIGINT
-    +platform: STRING
     +country: STRING
-    <<partition>> dt: STRING, app_id_part: BIGINT
   }
-  class search_terms {
-    +app_id: BIGINT
-    +metric_date: DATE
-    +search_term: STRING
-    +impressions: BIGINT
-    +product_page_views: BIGINT
-    <<partition>> dt: STRING, app_id_part: BIGINT
-  }
-  class deletions {
-    +app_id: BIGINT
-    +metric_date: DATE
-    +deletions: BIGINT
-    +country: STRING
-    <<partition>> dt: STRING, app_id_part: BIGINT
-  }
-  class purchases {
-    +app_id: BIGINT
-    +sku: STRING
-    +product_type_id: STRING
-    +units: BIGINT
-    +developer_proceeds: DOUBLE
-    +customer_currency: STRING
-    +country: STRING
-    +version: STRING
-    +title: STRING
-    +report_date: DATE
-    <<partition>> dt: STRING
-  }
-
 ```
+
+</details>
 
 ---
 
-## 10) Error handling & SLAs (ops loop)
+## Contributing
 
-```mermaid
-flowchart TD
-  A["Poller error / 409 from Apple"] --> B["Log full JSON<br/>(classify: auth/rate/attribute)"]
-  B --> C{"Retry Policy"}
-  C -- "429/5xx" --> D["Exponential Backoff + Jitter"]
-  C -- "4xx schema" --> E["Fix payload/reportType<br/>resubmit"]
-  D --> F["Continue"]
-  E --> F["Continue"]
-  F --> G["Alert if window stale > 24h"]
-
-```
+1. Create feature branch
+2. Make changes
+3. Test with `python3 daily_etl.py --app-id 1506886061`
+4. Verify data in Athena
+5. Submit PR
 
 ---
 
-### That’s the whole picture
+## License
 
-* You can drop these into your docs or PRDs as-is.
-* If you want, I can generate a **single PDF** with all diagrams or a **README.md** that your team can commit to the repo.
+Internal use only - SKIDOS
