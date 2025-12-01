@@ -1,400 +1,183 @@
-# Apple Analytics ETL Pipeline
+# 🍎 Apple Analytics ETL Pipeline
 
-> **Last Updated:** 2025-11-28  
-> **Status:** ✅ Production Ready
+> **Status**: ✅ Production Ready  
+> **Last Updated**: December 1, 2025  
+> **Apps**: 92 configured | 74 with active data
 
-A complete ETL pipeline for extracting Apple App Store Connect Analytics data and loading it into AWS Athena for business intelligence and dashboards.
-
----
-
-## Table of Contents
-
-1. [Quick Start](#quick-start)
-2. [Architecture Overview](#architecture-overview)
-3. [Implementation Status](#implementation-status)
-4. [Project Structure](#project-structure)
-5. [Data Flow](#data-flow)
-6. [Usage Guide](#usage-guide)
-7. [Athena Tables](#athena-tables)
-8. [Configuration](#configuration)
-9. [Troubleshooting](#troubleshooting)
+Automated ETL pipeline for extracting Apple App Store Connect Analytics data and loading it into AWS Athena.
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ```bash
-# 1. Activate virtual environment
+# 1. Navigate to directory
 cd /Users/ankit_chauhan/Desktop/PlayGroundS/Download_Pipeline/Apple-Analytics
+
+# 2. Activate virtual environment
 source ../.venv/bin/activate
 
-# 2. Run daily ETL (extracts yesterday's data)
-python3 daily_etl.py
-
-# 3. Or run for a specific app/date
-python3 daily_etl.py --app-id 1506886061 --date 2025-11-26
+# 3. Run ETL (extracts yesterday's data for all 92 apps)
+python3 unified_etl.py
 ```
 
 ---
 
-## Architecture Overview
+## 📊 Current Status (December 1, 2025)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        APPLE ANALYTICS ETL PIPELINE                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
-│  │ Apple API    │───▶│ Extract      │───▶│ Transform    │───▶│ Load      │ │
-│  │ (ASC)        │    │ (Raw → S3)   │    │ (Curate)     │    │ (Athena)  │ │
-│  └──────────────┘    └──────────────┘    └──────────────┘    └───────────┘ │
-│         │                   │                   │                   │       │
-│         ▼                   ▼                   ▼                   ▼       │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
-│  │ Analytics    │    │ s3://bucket/ │    │ s3://bucket/ │    │ Athena    │ │
-│  │ Sales API    │    │ appstore/raw │    │ appstore/    │    │ Tables    │ │
-│  │ Reviews API  │    │              │    │ curated/     │    │           │ │
-│  └──────────────┘    └──────────────┘    └──────────────┘    └───────────┘ │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| Athena Table | Rows | Apps | Status |
+|--------------|------|------|--------|
+| `curated_downloads` | 7,296,780 | 74 | ✅ 0 duplicates |
+| `curated_engagement` | 4,948,856 | 57 | ✅ 0 duplicates |
+| `curated_sessions` | 503,458 | 63 | ✅ 0 duplicates |
+| `curated_installs` | 450,691 | 57 | ✅ 0 duplicates |
+| `curated_purchases` | 437,988 | 65 | ✅ 0 duplicates |
 
 ---
 
-## Implementation Status
-
-### ✅ Implemented Features
-
-| Feature | Status | File |
-|---------|--------|------|
-| **ONGOING Request Support** | ✅ Done | `src/extract/apple_analytics_client.py` |
-| **ONE_TIME_SNAPSHOT Backfill** | ✅ Done | `src/extract/apple_analytics_client.py` |
-| **S3 Registry (avoid 409s)** | ✅ Done | `src/extract/apple_analytics_client.py` |
-| **Daily ETL Script** | ✅ Done | `daily_etl.py` |
-| **Downloads Extraction** | ✅ Done | `src/extract/focused_data_extractor.py` |
-| **Engagement Extraction** | ✅ Done | `src/extract/focused_data_extractor.py` |
-| **Sales & Trends API** | ✅ Done | `src/extract/apple_analytics_client.py` |
-| **Data Curation (Parquet)** | ✅ Done | `src/transform/apple_analytics_data_curator_production.py` |
-| **Athena Table Manager** | ✅ Done | `src/load/athena_table_manager_production.py` |
-| **JWT Auto-Refresh** | ✅ Done | `src/extract/apple_analytics_client.py` |
-| **Error Handling & Retry** | ✅ Done | All modules |
-
-### 📊 Data Available in Athena
-
-| Database | Table | Rows | Status |
-|----------|-------|------|--------|
-| `appstore` | `appstore_downloads` | 17M+ | ✅ Fresh |
-| `appstore` | `appstore_engagement` | 29M+ | ✅ Fresh |
-| `appstore` | `raw_installs` | Available | ✅ |
-| `appstore` | `raw_sessions` | Available | ✅ |
-| `appstore` | `raw_purchases` | Available | ✅ |
-| `curated` | `downloads` | Available | ✅ |
-| `curated` | `engagement` | Available | ✅ |
-| `curated` | `purchases` | Available | ✅ |
-| `curated` | `search_terms` | Available | ✅ |
-| `curated` | `deletions` | Available | ✅ |
-
-### 🔄 Planned But Not Yet Implemented
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Reviews Sentiment Analysis | ⏳ Planned | Topic clustering needed |
-| QuickSight Dashboard | ⏳ Planned | Can use Athena directly |
-| Alerting (Stale Data) | ⏳ Planned | CloudWatch integration |
-| Airflow DAG Integration | ✅ Ready | `airflow/dags/apple_ingestion.py` exists |
-
----
-
-## Project Structure
+## 📁 Project Structure
 
 ```
 Apple-Analytics/
-├── daily_etl.py                 # 🚀 Main daily ETL script (ONGOING requests)
-├── run_daily_etl.sh             # Shell wrapper for cron jobs
-├── production_manager.py        # Production orchestration
-├── complete_etl_health_check.py # Health check script
+├── unified_etl.py           # 🔑 Main ETL script (Extract → Transform → Load)
+├── daily_cron.sh            # Cron wrapper for automation
+├── startup_verification.sh  # Health check script
+├── .env                     # Configuration (not in git)
+├── .env.template            # Config template
 │
-├── src/
-│   ├── extract/
-│   │   ├── apple_analytics_client.py      # Apple API client (JWT, requests)
-│   │   ├── focused_data_extractor.py      # Report extraction logic
-│   │   └── apple_request_status_checker.py
-│   │
-│   ├── transform/
-│   │   └── apple_analytics_data_curator_production.py  # CSV → Parquet
-│   │
-│   ├── load/
-│   │   └── athena_table_manager_production.py  # Athena DDL management
-│   │
-│   └── orchestration/
-│       └── unified_production_etl.py       # Full ETL orchestration
+├── src/extract/
+│   └── apple_analytics_client.py  # Apple API client with JWT auth
 │
-├── config/                      # Configuration templates
-├── logs/                        # ETL execution logs
-├── data/                        # Local data cache
-└── archive/                     # Old verification scripts
-```
-
----
-
-## Data Flow
-
-### Daily ETL Flow (ONGOING Requests)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Daily ETL Flow                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  1. Check S3 Registry for existing ONGOING request              │
-│     └── s3://skidos-apptrack/analytics_requests/registry/       │
-│                                                                 │
-│  2. If not found → Query Apple API                              │
-│     └── GET /apps/{app_id}/analyticsReportRequests              │
-│         ?filter[accessType]=ONGOING                             │
-│                                                                 │
-│  3. If still not found → Create new ONGOING request             │
-│     └── POST /analyticsReportRequests                           │
-│         {"accessType": "ONGOING"}                               │
-│                                                                 │
-│  4. Save request_id to S3 registry for next time                │
-│                                                                 │
-│  5. Traverse: Reports → Instances → Segments → Files            │
-│                                                                 │
-│  6. Download CSV files to S3                                    │
-│     └── s3://skidos-apptrack/appstore/raw/{type}/dt=.../        │
-│                                                                 │
-│  7. Transform to Parquet (optional)                             │
-│     └── s3://skidos-apptrack/appstore/curated/{type}/           │
-│                                                                 │
-│  8. Query via Athena                                            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### S3 Directory Structure
-
-```
-s3://skidos-apptrack/
-├── appstore/
-│   ├── raw/
-│   │   ├── downloads/dt=2025-11-27/app_id=1506886061/
-│   │   ├── engagement/dt=2025-11-27/app_id=1506886061/
-│   │   ├── installs/dt=2025-11-27/app_id=1506886061/
-│   │   └── sessions/dt=2025-11-27/app_id=1506886061/
-│   │
-│   ├── raw_sales/SALES/DAILY/reportDate=2025-11-27/
-│   │
-│   └── curated/
-│       ├── downloads/dt=2025-11-27/app_id=1506886061/
-│       └── engagement/dt=2025-11-27/app_id=1506886061/
+├── sql/
+│   └── setup_curated_tables.sql   # Athena table definitions
 │
-└── analytics_requests/
-    └── registry/
-        └── app_id=1506886061/
-            └── ongoing.json   # Cached request ID
+├── logs/                    # ETL execution logs
+└── config/                  # Additional configuration
 ```
 
 ---
 
-## Usage Guide
+## 🔧 Usage
 
-### Daily Automated Extraction
+### Daily Automated Run
+Pipeline runs automatically at **6 AM daily** via cron.
 
-```bash
-# Run for all apps (92 configured)
-python3 daily_etl.py
-
-# Run for specific app
-python3 daily_etl.py --app-id 1506886061
-
-# Run for specific date
-python3 daily_etl.py --date 2025-11-26
-
-# Via shell script (for cron)
-./run_daily_etl.sh
-```
-
-### Cron Job Setup
+### Manual Commands
 
 ```bash
-# Add to crontab - runs at 4 PM UTC daily (after Apple data is available)
-0 16 * * * cd /path/to/Apple-Analytics && ./run_daily_etl.sh >> /var/log/apple_etl.log 2>&1
+# Full ETL for yesterday
+python3 unified_etl.py
+
+# Specific date
+python3 unified_etl.py --date 2025-11-28
+
+# Specific app
+python3 unified_etl.py --app-id 1506886061
+
+# Transform only (re-curate existing raw data)
+python3 unified_etl.py --transform-only --date 2025-11-28
+
+# Load only (refresh Athena partitions)
+python3 unified_etl.py --load-only
+
+# Backfill last N days
+python3 unified_etl.py --backfill --days 30
 ```
 
-### Health Check
+### Verification
 
 ```bash
-python3 complete_etl_health_check.py
-```
+# Run health check
+./startup_verification.sh
 
-### Query Data in Athena
+# Check logs
+tail -f logs/unified_etl_$(date +%Y%m%d).log
 
-```sql
--- Check downloads for an app
-SELECT metric_date, total_downloads, first_time_downloads
-FROM appstore.appstore_downloads
-WHERE app_apple_id = 1506886061
-ORDER BY metric_date DESC
-LIMIT 10;
-
--- Check engagement metrics
-SELECT metric_date, impressions, product_page_views
-FROM appstore.appstore_engagement
-WHERE app_apple_id = 1506886061
-ORDER BY metric_date DESC
-LIMIT 10;
+# Verify cron
+crontab -l
 ```
 
 ---
 
-## Athena Tables
+## 🏗️ Architecture
 
-### Database: `appstore` (Raw Data)
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐
+│ Apple API    │───▶│ S3 Raw       │───▶│ S3 Curated   │───▶│ Athena    │
+│ (Analytics)  │    │ (CSV)        │    │ (Parquet)    │    │ (Tables)  │
+└──────────────┘    └──────────────┘    └──────────────┘    └───────────┘
+```
 
-| Table | Description | Key Columns |
-|-------|-------------|-------------|
-| `appstore_downloads` | Daily download metrics | `app_apple_id`, `metric_date`, `total_downloads`, `first_time_downloads` |
-| `appstore_engagement` | Impressions & page views | `app_apple_id`, `metric_date`, `impressions`, `product_page_views` |
-| `raw_installs` | Install/deletion events | `app_id`, `date`, `installs`, `deletions` |
-| `raw_sessions` | App session metrics | `app_id`, `date`, `sessions`, `active_devices` |
-| `raw_purchases` | In-app purchases | `app_id`, `sku`, `units`, `proceeds` |
-
-### Database: `curated` (Processed Data)
-
-| Table | Description | Key Columns |
-|-------|-------------|-------------|
-| `downloads` | Curated downloads | `app_id`, `metric_date`, `country`, `platform` |
-| `engagement` | Curated engagement | `app_id`, `metric_date`, `source_type`, `page_type` |
-| `purchases` | Curated purchases | `app_id`, `sku`, `report_date`, `units`, `revenue` |
-| `search_terms` | ASO search data | `app_id`, `search_term`, `impressions` |
-| `deletions` | App deletions | `app_id`, `metric_date`, `deletions` |
+**S3 Structure:**
+```
+s3://skidos-apptrack/appstore/
+├── raw/{type}/dt=YYYY-MM-DD/app_id=NNNN/*.csv
+└── curated/{type}/dt=YYYY-MM-DD/app_id=NNNN/data.parquet
+```
 
 ---
 
-## Configuration
+## 📖 Full Documentation
 
-### Environment Variables (`.env`)
+For comprehensive documentation including:
+- Complete pipeline flow diagrams
+- Deduplication logic details  
+- Troubleshooting guide
+- FAQ
+
+See: **[COMPLETE_PIPELINE_DOCUMENTATION.md](./COMPLETE_PIPELINE_DOCUMENTATION.md)**
+
+---
+
+## ⚙️ Configuration
+
+Required environment variables in `.env`:
 
 ```bash
-# Apple App Store Connect
-ASC_ISSUER_ID=your-issuer-id
-ASC_KEY_ID=your-key-id
+# Apple API
+ASC_ISSUER_ID=xxx
+ASC_KEY_ID=xxx
 ASC_P8_PATH=/path/to/AuthKey.p8
-
-# Vendor & Apps
-APPLE_VENDOR_NUMBER=85875515
-APP_IDS=1506886061,1159612010,1468754350,...
 
 # AWS
 AWS_REGION=us-east-1
 S3_BUCKET=skidos-apptrack
-S3_PREFIX=appstore/
 
-# Athena
-GLUE_DB=appstore
-ATHENA_WORKGROUP=primary
-ATHENA_OUTPUT=s3://skidos-apptrack/Athena-Output/
-```
-
-### Apps Configured
-
-Currently **92 apps** are configured in `APP_IDS`. Key apps include:
-- `1506886061` - Doctor Games for Kids (17M+ downloads)
-- `1159612010` - Another high-volume app
-- `1468754350` - Chess for Kids
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| 409 Conflict | Request already exists | Use ONGOING requests (fixed!) |
-| 401 Unauthorized | JWT expired | Auto-refresh handles this |
-| 403 Forbidden | No permission to list requests | Registry fallback works |
-| Timeout errors | Apple API slow | Increase timeout, retry |
-| No data for date | Data not yet published | Apple publishes ~2 days late |
-
-### Logs
-
-```bash
-# Check ETL logs
-tail -f logs/daily_etl_*.log
-
-# Check results
-cat daily_etl_results_*.json
-```
-
-### Verify S3 Registry
-
-```bash
-aws s3 cat s3://skidos-apptrack/analytics_requests/registry/app_id=1506886061/ongoing.json
+# Apps (92 app IDs)
+APP_IDS=1506886061,1159612010,...
 ```
 
 ---
 
-## Original Design Diagrams
+## 🔍 Sample Athena Queries
 
-<details>
-<summary>Click to expand architecture diagrams</summary>
+```sql
+-- Daily downloads
+SELECT app_name, metric_date, SUM(total_downloads) as downloads
+FROM appstore.curated_downloads
+WHERE dt >= '2025-11-01'
+GROUP BY app_name, metric_date
+ORDER BY downloads DESC;
 
-### System Overview
-```mermaid
-flowchart LR
-  A["Apple App Store Connect"] -->|CSV/TSV.GZ| B["Raw S3"]
-  B --> C["Curators"]
-  C -->|Parquet| D["Curated S3"]
-  D --> E["Athena/Glue"]
-  E --> F["Dashboards"]
+-- Check for duplicates (should return 0)
+SELECT COUNT(*) - COUNT(DISTINCT CONCAT(
+    CAST(metric_date AS VARCHAR), app_name, CAST(app_id AS VARCHAR), 
+    territory, download_type, source_type, device, platform_version
+)) as duplicates
+FROM appstore.curated_downloads
+WHERE dt = '2025-11-28';
 ```
-
-### ONGOING Daily Feed
-```mermaid
-flowchart TD
-  A["Create ONGOING request"] --> B["Daily Poller"]
-  B --> C["Check today's files"]
-  C -- "available" --> D["Raw S3 ingest"]
-  D --> E["Curate -> Parquet"]
-  E --> F["Dashboards refresh"]
-```
-
-### Data Model
-```mermaid
-classDiagram
-  class engagement {
-    +app_id: BIGINT
-    +metric_date: DATE
-    +impressions: BIGINT
-    +product_page_views: BIGINT
-    +source_type: STRING
-    +country: STRING
-  }
-  class downloads {
-    +app_id: BIGINT
-    +metric_date: DATE
-    +first_time_downloads: BIGINT
-    +total_downloads: BIGINT
-    +country: STRING
-  }
-```
-
-</details>
 
 ---
 
-## Contributing
+## 📝 Changelog
 
-1. Create feature branch
-2. Make changes
-3. Test with `python3 daily_etl.py --app-id 1506886061`
-4. Verify data in Athena
-5. Submit PR
+| Date | Changes |
+|------|---------|
+| 2025-12-01 | v2.0 - Fixed deduplication, consolidated docs, repository cleanup |
+| 2025-11-28 | v1.5 - Unified ETL script, cron automation |
+| 2025-11-27 | v1.0 - Initial production deployment |
 
 ---
 
-## License
-
-Internal use only - SKIDOS
+**License**: Internal use only - SKIDOS
