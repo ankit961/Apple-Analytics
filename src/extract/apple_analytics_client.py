@@ -130,30 +130,46 @@ class AppleAnalyticsRequestor:
             logger.error(f"❌ JWT refresh failed: {e}")
             raise
     
-    def _asc_request(self, method: str, url: str, **kwargs):
+    def _asc_request(self, method: str, url: str, max_retries: int = 3, **kwargs):
         """
         Auto-refreshing requests wrapper for Apple API calls
         Handles 401 errors with automatic JWT token renewal
+        Includes retry logic for connection errors
         """
         # Check if token needs refresh before making request
         if self._need_refresh():
             self._refresh_headers()
         
-        # Make the request
-        try:
-            response = requests.request(method, url, headers=self.headers, **kwargs)
-            
-            # If we get 401, try to refresh token once and retry
-            if response.status_code == 401:
-                logger.warning("🔄 Got 401, refreshing token and retrying...")
-                self._refresh_headers()
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
                 response = requests.request(method, url, headers=self.headers, **kwargs)
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"❌ Request failed: {method} {url} - {e}")
-            raise
+                
+                # If we get 401, try to refresh token once and retry
+                if response.status_code == 401:
+                    logger.warning("🔄 Got 401, refreshing token and retrying...")
+                    self._refresh_headers()
+                    response = requests.request(method, url, headers=self.headers, **kwargs)
+                
+                return response
+                
+            except (requests.exceptions.ConnectionError, 
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
+                    logger.warning(f"⚠️ Connection error (attempt {attempt+1}/{max_retries}), retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ Request failed after {max_retries} attempts: {method} {url} - {e}")
+            except Exception as e:
+                logger.error(f"❌ Request failed: {method} {url} - {e}")
+                raise
+        
+        if last_exception:
+            raise last_exception
     
     # S3 Registry Helpers
     def _registry_key_for_app(self, app_id: str, access_type: str = "ONE_TIME_SNAPSHOT") -> str:

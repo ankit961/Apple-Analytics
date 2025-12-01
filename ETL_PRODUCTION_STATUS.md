@@ -1,7 +1,7 @@
 # Apple Analytics ETL Pipeline - Production Status
 
-**Last Updated**: 2025-11-28  
-**Status**: ✅ Production Ready
+**Last Updated**: 2025-12-01  
+**Status**: ✅ Production Ready - All Data Types Working
 
 ## Overview
 
@@ -17,47 +17,45 @@ This ETL pipeline extracts data from Apple App Store Connect Analytics API and l
          │                          │
          │                          ▼
          │                 ┌──────────────────┐
-         │                 │  Batch Curator   │
-         │                 │  (CSV→Parquet)   │
+         │                 │ Unified ETL      │
+         │                 │ (Extract→       │
+         │                 │  Transform→Load) │
          │                 └──────────────────┘
          │                          │
          │                          ▼
          │                 ┌──────────────────┐
          └────────────────▶│ Curated Parquet  │
-                           │   (Optimized)    │
+                           │   (Deduplicated) │
                            └──────────────────┘
 ```
 
 ## ✅ What's Implemented
 
-### 1. Daily ETL Pipeline (`daily_etl.py`)
+### 1. Unified ETL Pipeline (`unified_etl.py`)
+- **Single script** for complete ETL (Extract → Transform → Load)
 - **ONGOING requests** (not ONE_TIME_SNAPSHOT) - avoids 409 conflicts
+- **Deduplication** at raw level before transformation
+- **Aggregation** by all dimension columns with metric summing
 - Automatic extraction of yesterday's data
 - Registry-based request management (reuses existing requests)
 - All 92 apps configured
-- Data types: downloads, engagement, sessions, installs, purchases, reviews
+- Data types: downloads, engagement, sessions, installs, purchases
 
-### 2. Batch Curator (`batch_curate.py`)
-- Transforms raw CSV to optimized Parquet format
-- Processes all 6 data types:
-  - ✅ Downloads
-  - ✅ Engagement
-  - ✅ Sessions
-  - ✅ Installs
-  - ✅ Purchases
-  - ✅ Reviews (JSON parsing)
+### 2. Deduplication Logic
+Apple's API sometimes provides overlapping data segments. The pipeline handles this:
+```python
+def _transform_dataframe(self, data_type, df, app_id, target_date):
+    # First, deduplicate raw data (Apple's overlapping segments)
+    df = df.drop_duplicates()
+    
+    # Transform to curated schema
+    curated = pd.DataFrame({...})
+    
+    # Aggregate by all dimensions, sum metrics
+    return curated.groupby(group_cols, as_index=False).agg({'total_downloads': 'sum'})
+```
 
-### 3. Historical Backfill (`historical_backfill.py`)
-- Supports date range extraction
-- Command-line arguments for flexibility
-- Progress tracking
-
-### 4. Cron Automation
-- `run_daily_pipeline.sh` - Complete daily automation script
-- `cron_setup.sh` - Interactive cron job setup
-- Automatic log rotation (30 days)
-
-### 5. S3 Structure
+### 3. S3 Structure
 ```
 s3://skidos-apptrack/appstore/
 ├── raw/
@@ -65,56 +63,59 @@ s3://skidos-apptrack/appstore/
 │   ├── engagement/dt=YYYY-MM-DD/app_id=NNNN/*.csv
 │   ├── sessions/dt=YYYY-MM-DD/app_id=NNNN/*.csv
 │   ├── installs/dt=YYYY-MM-DD/app_id=NNNN/*.csv
-│   ├── purchases/dt=YYYY-MM-DD/app_id=NNNN/*.csv
-│   └── reviews/dt=YYYY-MM-DD/app_id=NNNN/*.json
+│   └── purchases/dt=YYYY-MM-DD/app_id=NNNN/*.csv
 └── curated/
     ├── downloads/dt=YYYY-MM-DD/app_id=NNNN/data.parquet
     ├── engagement/dt=YYYY-MM-DD/app_id=NNNN/data.parquet
     ├── sessions/dt=YYYY-MM-DD/app_id=NNNN/data.parquet
     ├── installs/dt=YYYY-MM-DD/app_id=NNNN/data.parquet
-    ├── purchases/dt=YYYY-MM-DD/app_id=NNNN/data.parquet
-    └── reviews/dt=YYYY-MM-DD/app_id=NNNN/data.parquet
+    └── purchases/dt=YYYY-MM-DD/app_id=NNNN/data.parquet
 ```
 
-### 6. Athena Tables (Curated)
-| Table | Status | Rows |
-|-------|--------|------|
-| curated_downloads | ✅ Working | 6.3M+ |
-| curated_engagement | ✅ Working | 10.3M+ |
-| curated_sessions | ✅ Schema Ready | Processing |
-| curated_installs | ✅ Schema Ready | Processing |
-| curated_purchases | ✅ Working | 324K+ |
-| curated_reviews | ✅ Working | 4.2K+ |
+### 4. Athena Tables (Curated) - As of 2025-12-01
+| Table | Status | Rows | Apps | Partitions |
+|-------|--------|------|------|------------|
+| curated_downloads | ✅ Working | 7,296,780 | 74 | 7 |
+| curated_engagement | ✅ Working | 4,948,856 | 57 | 3 |
+| curated_sessions | ✅ Working | 503,458 | 63 | 2 |
+| curated_installs | ✅ Working | 450,691 | 57 | 2 |
+| curated_purchases | ✅ Working | 437,988 | 65 | 7 |
+
+### 5. Cron Automation
+```bash
+# Installed cron job (runs at 6 AM daily)
+0 6 * * * /Users/ankit_chauhan/Desktop/PlayGroundS/Download_Pipeline/Apple-Analytics/daily_cron.sh >> logs/cron.log 2>&1
+```
 
 ## 🔧 Production Usage
 
 ### Daily Automated Run (Cron)
-```bash
-# Install cron job (runs at 6 AM daily)
-./cron_setup.sh
-
-# Manual check
-crontab -l
-```
+The pipeline runs automatically at 6 AM daily via cron.
 
 ### Manual Execution
 ```bash
-# Extract yesterday's data
 cd Apple-Analytics
-python3 daily_etl.py
 
-# Curate to Parquet
-cd ..
-python3 batch_curate.py
+# Full ETL (extract + transform + load)
+python3 unified_etl.py
 
-# Historical backfill (last 30 days)
-python3 historical_backfill.py --days 30
+# Specific date
+python3 unified_etl.py --date 2025-11-28
+
+# Transform-only (re-curate existing raw data)
+python3 unified_etl.py --transform-only --date 2025-11-28
+
+# Load-only (refresh Athena partitions)
+python3 unified_etl.py --load-only
+
+# Backfill last 30 days
+python3 unified_etl.py --backfill --days 30
 ```
 
 ### Monitor Pipeline
 ```bash
 # Check logs
-tail -f logs/daily_pipeline_$(date +%Y-%m-%d).log
+tail -f logs/unified_etl_$(date +%Y%m%d).log
 
 # Query Athena
 aws athena start-query-execution \
@@ -126,18 +127,9 @@ aws athena start-query-execution \
 
 | File | Purpose |
 |------|---------|
-| `daily_etl.py` | Extract from Apple API (ONGOING requests) |
-| `batch_curate.py` | Transform CSV→Parquet |
-| `historical_backfill.py` | Backfill historical data |
-| `run_daily_pipeline.sh` | Complete daily automation |
-| `cron_setup.sh` | Cron job installer |
+| `unified_etl.py` | Complete ETL (Extract→Transform→Load) |
+| `daily_cron.sh` | Cron wrapper script |
 | `src/extract/apple_analytics_client.py` | Apple API client |
-
-## ⚠️ Known Limitations
-
-1. **Raw Tables**: Raw Athena tables have partition projection issues (curated tables work fine)
-2. **Historical Data**: Apple API provides up to 365 days of historical data
-3. **Rate Limits**: Apple API has rate limits; large backfills may take time
 
 ## 🔐 Required Environment Variables
 
@@ -178,6 +170,14 @@ SELECT app_name, SUM(impressions) as impressions
 FROM appstore.curated_engagement
 GROUP BY app_name
 ORDER BY impressions DESC;
+
+-- Check for duplicates (should return 0)
+SELECT COUNT(*) - COUNT(DISTINCT CONCAT(
+    CAST(metric_date AS VARCHAR), app_name, CAST(app_id AS VARCHAR), 
+    territory, download_type, source_type, device, platform_version
+)) as duplicates
+FROM appstore.curated_downloads
+WHERE dt = '2025-11-28';
 ```
 
 ## ✅ Production Checklist
@@ -186,12 +186,15 @@ ORDER BY impressions DESC;
 - [x] Daily extraction automation
 - [x] S3 partitioned storage
 - [x] CSV→Parquet curation
-- [x] All 6 data types supported
-- [x] Reviews JSON parsing
+- [x] Deduplication before transformation
+- [x] Aggregation by dimensions
+- [x] All 5 data types supported
 - [x] Athena table schemas
-- [x] Cron job setup script
-- [x] Log rotation
-- [x] Historical backfill support
+- [x] Cron job installed
+- [x] Unified ETL script
+- [x] Transform-only mode
+- [x] Load-only mode
+- [x] Backfill support
 - [ ] Alerting/monitoring (optional)
 - [ ] Dashboard integration (optional)
 

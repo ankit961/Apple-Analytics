@@ -1,0 +1,31 @@
+# Secrets and credentials
+.env
+*.p8
+AuthKey_*.p8
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Logs and temp files
+logs/
+*.log
+*.json
+!config/*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archive (local only)
+archive/
