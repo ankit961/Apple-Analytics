@@ -137,28 +137,28 @@ The Apple Analytics ETL Pipeline automates the daily extraction, transformation,
 
 ```mermaid
 flowchart TD
-    A[⏰ Cron Job Triggers at 6 AM] --> B[daily_cron.sh]
-    B --> C[Activate Virtual Environment]
-    C --> D[python3 unified_etl.py]
-    D --> E{EXTRACT PHASE}
-    E --> F[Generate JWT Token]
-    F --> G[For Each of 92 Apps]
-    G --> H[Get/Create ONGOING Request]
-    H --> I[Download All Report Segments]
-    I --> J[Save CSV to S3 Raw]
-    J --> K{All Apps Done?}
+    A["⏰ Cron Job Triggers at 6 AM"] --> B["daily_cron.sh"]
+    B --> C["Activate Virtual Environment"]
+    C --> D["python3 unified_etl.py"]
+    D --> E{"EXTRACT PHASE"}
+    E --> F["Generate JWT Token"]
+    F --> G["For Each of 92 Apps"]
+    G --> H["Get/Create ONGOING Request"]
+    H --> I["Download All Report Segments"]
+    I --> J["Save CSV to S3 Raw"]
+    J --> K{"All Apps Done?"}
     K -->|No| G
-    K -->|Yes| L{TRANSFORM PHASE}
-    L --> M[For Each Data Type]
-    M --> N[Read All CSVs for Date]
-    N --> O[⭐ DEDUPLICATE: df.drop_duplicates()]
-    O --> P[⭐ AGGREGATE: groupby().sum()]
-    P --> Q[Save Parquet to S3 Curated]
-    Q --> R{All Types Done?}
+    K -->|Yes| L{"TRANSFORM PHASE"}
+    L --> M["For Each Data Type"]
+    M --> N["Read All CSVs for Date"]
+    N --> O["⭐ DEDUPLICATE: df.drop_duplicates()"]
+    O --> P["⭐ AGGREGATE: groupby().sum()"]
+    P --> Q["Save Parquet to S3 Curated"]
+    Q --> R{"All Types Done?"}
     R -->|No| M
-    R -->|Yes| S{LOAD PHASE}
-    S --> T[MSCK REPAIR TABLE for all tables]
-    T --> U[✅ ETL Complete]
+    R -->|Yes| S{"LOAD PHASE"}
+    S --> T["MSCK REPAIR TABLE for all tables"]
+    T --> U["✅ ETL Complete"]
 ```
 
 ### Step-by-Step Breakdown
