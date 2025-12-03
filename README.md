@@ -1,7 +1,7 @@
 # 🍎 Apple Analytics ETL Pipeline
 
 > **Status**: ✅ Production Ready  
-> **Last Updated**: December 1, 2025  
+> **Last Updated**: December 3, 2025  
 > **Apps**: 92 configured | 74 with active data
 
 Automated ETL pipeline for extracting Apple App Store Connect Analytics data and loading it into AWS Athena.
@@ -23,15 +23,16 @@ python3 unified_etl.py
 
 ---
 
-## 📊 Current Status (December 1, 2025)
+## 📊 Current Status (December 3, 2025)
 
 | Athena Table | Rows | Apps | Status |
 |--------------|------|------|--------|
-| `curated_downloads` | 7,296,780 | 74 | ✅ 0 duplicates |
-| `curated_engagement` | 4,948,856 | 57 | ✅ 0 duplicates |
-| `curated_sessions` | 503,458 | 63 | ✅ 0 duplicates |
-| `curated_installs` | 450,691 | 57 | ✅ 0 duplicates |
-| `curated_purchases` | 437,988 | 65 | ✅ 0 duplicates |
+| `curated_downloads` | 8,423,289 | 74 | ✅ 0 duplicates |
+| `curated_engagement` | 5,287,303 | 57 | ✅ 0 duplicates |
+| `curated_sessions` | 554,199 | 63 | ✅ 0 duplicates |
+| `curated_installs` | 509,292 | 57 | ✅ 0 duplicates |
+| `curated_purchases` | 455,693 | 65 | ✅ 0 duplicates |
+| `curated_reviews` | 4,250 | - | ✅ 0 duplicates |
 
 ---
 
