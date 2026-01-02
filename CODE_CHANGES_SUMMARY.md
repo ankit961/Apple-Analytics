@@ -1,6 +1,36 @@
 # Code Changes Summary
 
-## File Modified: `unified_etl.py`
+## Latest Changes (January 2, 2026)
+
+### Code Review Fixes - Phase 2
+
+#### 1. Method Rename for Clarity
+**File:** `unified_etl.py`
+- Renamed `create_onetime_request_for_range()` → `create_or_reuse_onetime_snapshot()`
+- More accurately describes the method's behavior (creates OR reuses)
+
+#### 2. Added Granularity Filter to ONE_TIME_SNAPSHOT
+**File:** `unified_etl.py`, `_extract_onetime_data()` method
+- Added `params={'filter[granularity]': 'DAILY'}` to instances API call
+- Now both ONGOING and ONE_TIME_SNAPSHOT modes filter for daily data
+
+#### 3. Updated Docstrings for Apple Date Range Behavior
+**File:** `unified_etl.py`
+- Added note: "Apple may ignore start_date/end_date and provide all historical data"
+- Clarified that filtering happens during extraction via `processingDate`
+
+#### 4. Deduplication Views for Apple Corrections
+**File:** `sql/create_dedup_views.sql` (NEW)
+- Created views that handle Apple data corrections/re-sends
+- Uses `ROW_NUMBER()` to pick latest `dt` per logical key
+- Views: `v_downloads_dedup`, `v_engagement_dedup`, `v_sessions_dedup`, `v_installs_dedup`, `v_purchases_dedup`
+- Summary views: `v_daily_downloads_summary`, `v_daily_engagement_summary`, etc.
+
+**Why needed:** Apple can re-send corrected data in later `processingDate` batches, causing duplicate logical rows across `dt` partitions. The deduplication views select the most recent `dt` for each logical key.
+
+---
+
+## Previous Changes (December 2025)
 
 ### 1. Module Docstring Update (Lines 1-25)
 
@@ -138,9 +168,9 @@ def _validate_request_is_available(self, request_id: str) -> bool:
         return False
 ```
 
-#### Method C: `create_onetime_request_for_range()`
+#### Method C: `create_or_reuse_onetime_snapshot()`
 ```python
-def create_onetime_request_for_range(self, app_id: str, start_date: str, end_date: str) -> Optional[str]:
+def create_or_reuse_onetime_snapshot(self, app_id: str, start_date: str, end_date: str) -> Optional[str]:
     """
     Create or reuse ONE_TIME_SNAPSHOT request for date range
     Saves request ID to registry for future reference
@@ -310,7 +340,7 @@ if content[:2] == b'\x1f\x8b':  # ✅ Correct gzip magic bytes
 - ✅ Class docstring updated with new capabilities
 - ✅ `generate_date_range()` method added
 - ✅ `_validate_request_is_available()` method added
-- ✅ `create_onetime_request_for_range()` method added
+- ✅ `create_or_reuse_onetime_snapshot()` method added
 - ✅ `_extract_onetime_data()` method added
 - ✅ `run()` method updated to support both modes
 - ✅ CLI arguments updated (--onetime, --start-date, --end-date)

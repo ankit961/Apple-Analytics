@@ -156,10 +156,13 @@ class UnifiedETL:
             logger.warning(f"   ⚠️ Request validation error: {e}")
             return False
     
-    def create_onetime_request_for_range(self, app_id: str, start_date: str, end_date: str) -> Optional[str]:
+    def create_or_reuse_onetime_snapshot(self, app_id: str, start_date: str, end_date: str) -> Optional[str]:
         """
         Create or reuse ONE_TIME_SNAPSHOT request for date range
         Saves request ID to registry for future reference
+        
+        Note: Apple may ignore start_date/end_date and provide all historical data.
+        Filter by processingDate during extraction to get specific dates.
         
         Process:
         1. Try to load request from registry
@@ -435,6 +438,10 @@ class UnifiedETL:
         """
         Extract data from ONE_TIME_SNAPSHOT request for specific date
         
+        Note: Apple ONE_TIME_SNAPSHOT may return data for multiple dates in one response.
+        This method filters instances by processingDate to extract only the target_date.
+        Uses filter[granularity]=DAILY to get daily-level data.
+        
         Args:
             app_id: Application ID
             request_id: ONE_TIME_SNAPSHOT request ID
@@ -471,9 +478,11 @@ class UnifiedETL:
                 report_id = report['id']
                 report_name = report['attributes']['name']
                 
-                # Get instances for this report (filtered by date)
+                # Get instances for this report (filtered by DAILY granularity)
                 instances_url = f"{self.requestor.api_base}/analyticsReports/{report_id}/instances"
-                inst_response = self.requestor._asc_request('GET', instances_url, timeout=30)
+                inst_response = self.requestor._asc_request('GET', instances_url, 
+                                                            params={'filter[granularity]': 'DAILY'},
+                                                            timeout=30)
                 
                 if inst_response is None or inst_response.status_code != 200:
                     continue
@@ -779,7 +788,7 @@ class UnifiedETL:
             
             # Create requests and extract for each app
             for aid in app_ids:
-                request_id = self.create_onetime_request_for_range(aid, start_date, end_date)
+                request_id = self.create_or_reuse_onetime_snapshot(aid, start_date, end_date)
                 if not request_id:
                     logger.error(f"Failed to create request for app {aid}, skipping")
                     continue
