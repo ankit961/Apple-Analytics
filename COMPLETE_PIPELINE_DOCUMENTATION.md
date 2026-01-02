@@ -1,7 +1,7 @@
 # 🍎 Apple Analytics ETL Pipeline - Complete Documentation
 
 **Version**: 2.0 (Production Ready)  
-**Last Updated**: December 3, 2025  
+**Last Updated**: December 1, 2025  
 **Status**: ✅ **PRODUCTION READY - All Systems Operational**
 
 ---
@@ -28,14 +28,14 @@
 
 The Apple Analytics ETL Pipeline automates the daily extraction, transformation, and loading of Apple App Store Connect Analytics data for **92 apps** into AWS S3 and Athena for analysis.
 
-### Current Status (December 3, 2025)
+### Current Status (December 1, 2025)
 
 | Component | Status | Details |
 |-----------|--------|---------|
 | **Apps Configured** | ✅ 92 apps | All apps in .env APP_IDS |
 | **Deduplication** | ✅ Fixed | Raw dedup + aggregation |
-| **Data Types** | ✅ 6 types | downloads, engagement, sessions, installs, purchases, reviews |
-| **Athena Tables** | ✅ Working | All 6 tables, 0 duplicates |
+| **Data Types** | ✅ 5 types | downloads, engagement, sessions, installs, purchases |
+| **Athena Tables** | ✅ Working | All 5 tables, 0 duplicates |
 | **Cron Job** | ✅ Installed | 6 AM daily |
 | **Logging** | ✅ Active | File + console logging |
 
@@ -43,12 +43,11 @@ The Apple Analytics ETL Pipeline automates the daily extraction, transformation,
 
 | Table | Total Rows | Apps | Partitions | Date Range |
 |-------|------------|------|------------|------------|
-| curated_downloads | 8,423,289 | 74 | 7 | 2025-10-15 to 2025-11-28 |
-| curated_engagement | 5,287,303 | 57 | 3 | 2025-11-11 to 2025-11-28 |
-| curated_sessions | 554,199 | 63 | 2 | 2025-11-27 to 2025-11-28 |
-| curated_installs | 509,292 | 57 | 2 | 2025-11-27 to 2025-11-28 |
-| curated_purchases | 455,693 | 65 | 7 | 2025-10-27 to 2025-11-28 |
-| curated_reviews | 4,250 | - | - | - |
+| curated_downloads | 7,296,780 | 74 | 7 | 2025-10-15 to 2025-11-28 |
+| curated_engagement | 4,948,856 | 57 | 3 | 2025-11-11 to 2025-11-28 |
+| curated_sessions | 503,458 | 63 | 2 | 2025-11-27 to 2025-11-28 |
+| curated_installs | 450,691 | 57 | 2 | 2025-11-27 to 2025-11-28 |
+| curated_purchases | 437,988 | 65 | 7 | 2025-10-27 to 2025-11-28 |
 
 ---
 
@@ -120,12 +119,12 @@ The Apple Analytics ETL Pipeline automates the daily extraction, transformation,
 │                                                                               │
 │  ┌──────────────────────┐  ┌──────────────────────┐  ┌────────────────────┐  │
 │  │ curated_downloads    │  │ curated_engagement   │  │ curated_sessions   │  │
-│  │ 8.4M rows, 74 apps   │  │ 5.3M rows, 57 apps   │  │ 554K rows, 63 apps │  │
+│  │ 7.3M rows, 74 apps   │  │ 4.9M rows, 57 apps   │  │ 503K rows, 63 apps │  │
 │  └──────────────────────┘  └──────────────────────┘  └────────────────────┘  │
 │                                                                               │
 │  ┌──────────────────────┐  ┌──────────────────────┐                          │
 │  │ curated_installs     │  │ curated_purchases    │                          │
-│  │ 509K rows, 57 apps   │  │ 456K rows, 65 apps   │                          │
+│  │ 451K rows, 57 apps   │  │ 438K rows, 65 apps   │                          │
 │  └──────────────────────┘  └──────────────────────┘                          │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -138,28 +137,28 @@ The Apple Analytics ETL Pipeline automates the daily extraction, transformation,
 
 ```mermaid
 flowchart TD
-    A["⏰ Cron Job Triggers at 6 AM"] --> B["daily_cron.sh"]
-    B --> C["Activate Virtual Environment"]
-    C --> D["python3 unified_etl.py"]
-    D --> E{"EXTRACT PHASE"}
-    E --> F["Generate JWT Token"]
-    F --> G["For Each of 92 Apps"]
-    G --> H["Get/Create ONGOING Request"]
-    H --> I["Download All Report Segments"]
-    I --> J["Save CSV to S3 Raw"]
-    J --> K{"All Apps Done?"}
+    A[⏰ Cron Job Triggers at 6 AM] --> B[daily_cron.sh]
+    B --> C[Activate Virtual Environment]
+    C --> D[python3 unified_etl.py]
+    D --> E{EXTRACT PHASE}
+    E --> F[Generate JWT Token]
+    F --> G[For Each of 92 Apps]
+    G --> H[Get/Create ONGOING Request]
+    H --> I[Download All Report Segments]
+    I --> J[Save CSV to S3 Raw]
+    J --> K{All Apps Done?}
     K -->|No| G
-    K -->|Yes| L{"TRANSFORM PHASE"}
-    L --> M["For Each Data Type"]
-    M --> N["Read All CSVs for Date"]
-    N --> O["⭐ DEDUPLICATE: df.drop_duplicates()"]
-    O --> P["⭐ AGGREGATE: groupby().sum()"]
-    P --> Q["Save Parquet to S3 Curated"]
-    Q --> R{"All Types Done?"}
+    K -->|Yes| L{TRANSFORM PHASE}
+    L --> M[For Each Data Type]
+    M --> N[Read All CSVs for Date]
+    N --> O[⭐ DEDUPLICATE: df.drop_duplicates()]
+    O --> P[⭐ AGGREGATE: groupby().sum()]
+    P --> Q[Save Parquet to S3 Curated]
+    Q --> R{All Types Done?}
     R -->|No| M
-    R -->|Yes| S{"LOAD PHASE"}
-    S --> T["MSCK REPAIR TABLE for all tables"]
-    T --> U["✅ ETL Complete"]
+    R -->|Yes| S{LOAD PHASE}
+    S --> T[MSCK REPAIR TABLE for all tables]
+    T --> U[✅ ETL Complete]
 ```
 
 ### Step-by-Step Breakdown
@@ -267,7 +266,7 @@ def _transform_dataframe(self, data_type, df, app_id, target_date):
 
 ### Verification
 
-All tables have been verified to have **0 duplicates** as of December 3, 2025:
+All tables have been verified to have **0 duplicates** as of December 1, 2025:
 
 ```sql
 -- Verification query (should return 0)
@@ -555,7 +554,7 @@ python3 unified_etl.py --transform-only --date 2025-11-28
 
 ### Q: Is deduplication working properly?
 
-**A**: Yes, verified on December 3, 2025:
+**A**: Yes, verified on December 1, 2025:
 - Stage 1: `df.drop_duplicates()` removes exact duplicate rows
 - Stage 2: `groupby().sum()` aggregates any remaining duplicates
 - All 5 tables have 0 duplicates

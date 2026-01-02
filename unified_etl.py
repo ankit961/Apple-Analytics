@@ -3,21 +3,33 @@
 Apple Analytics - Unified Production ETL Pipeline
 ==================================================
 
-This is the SINGLE script for complete ETL:
-1. EXTRACT: Fetch data from Apple Analytics API (ONGOING requests)
+This is the SINGLE script for complete ETL supporting BOTH request types:
+1. EXTRACT: Fetch data from Apple Analytics API (ONGOING or ONE_TIME_SNAPSHOT)
 2. TRANSFORM: Convert raw CSV/JSON to optimized Parquet
 3. LOAD: Refresh Athena table partitions
 
-Usage:
-    python3 unified_etl.py                    # Process yesterday's data for all apps
-    python3 unified_etl.py --date 2025-11-27  # Process specific date
-    python3 unified_etl.py --app-id 1506886061  # Process specific app
-    python3 unified_etl.py --backfill --days 30  # Backfill last 30 days
-
-ONGOING Request Flow:
+ONGOING Requests (Daily Automation):
 - Day 1: Creates new ONGOING request, saves to S3 registry
 - Day 2+: Reuses same request from registry (ONGOING requests don't expire)
 - Apple adds new report instances daily, we fetch by processingDate
+- Use when: Running daily automated pipelines
+
+ONE_TIME_SNAPSHOT Requests (Backfill/Bulk Export):
+- Creates request with explicit start_date and end_date
+- Apple processes entire date range and provides all data at once
+- Reports available with instances for each date in range
+- Use when: Backfilling historical data, one-time exports, bulk recovery
+
+Usage:
+    # ONGOING Mode (Default)
+    python3 unified_etl.py                                  # Yesterday's data
+    python3 unified_etl.py --date 2025-11-27                # Specific date
+    python3 unified_etl.py --app-id 1506886061              # Specific app
+    python3 unified_etl.py --backfill --days 30             # Last 30 days (ONGOING)
+    
+    # ONE_TIME_SNAPSHOT Mode (Backfill/Bulk)
+    python3 unified_etl.py --onetime --start-date 2025-11-01 --end-date 2025-11-30
+    python3 unified_etl.py --onetime --start-date 2025-11-01 --end-date 2025-11-30 --app-id 1506886061
 """
 
 import os
@@ -66,10 +78,17 @@ class UnifiedETL:
     """
     Unified ETL Pipeline for Apple Analytics
     
+    Supports BOTH request types:
+    1. ONGOING: For daily automated pipelines (creates once, reuses forever)
+    2. ONE_TIME_SNAPSHOT: For backfills and bulk exports (explicit date range)
+    
     Complete flow:
-    1. EXTRACT: Uses ONGOING requests (created once, reused forever)
-    2. TRANSFORM: Converts raw CSV to Parquet
+    1. EXTRACT: Creates/reuses appropriate request type, downloads data
+    2. TRANSFORM: Converts raw CSV to Parquet with deduplication
     3. LOAD: Refreshes Athena partitions
+    
+    Use ONGOING (default) for daily automation.
+    Use ONE_TIME_SNAPSHOT for backfilling historical data or one-time exports.
     """
     
     def __init__(self):
@@ -87,7 +106,8 @@ class UnifiedETL:
             'files_extracted': 0,
             'files_curated': 0,
             'total_rows': 0,
-            'errors': []
+            'errors': [],
+            'request_ids': {}
         }
     
     def get_app_ids(self, specific_app_id: Optional[str] = None) -> List[str]:
@@ -100,6 +120,99 @@ class UnifiedETL:
             return [aid.strip() for aid in app_ids_env.split(',') if aid.strip()]
         
         return ['1506886061']
+    
+    def generate_date_range(self, start_date: str, end_date: str) -> List[str]:
+        """Generate list of dates between start and end (inclusive)"""
+        dates = []
+        current = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end = datetime.strptime(end_date, '%Y-%m-%d').date()
+        
+        while current <= end:
+            dates.append(current.strftime('%Y-%m-%d'))
+            current += timedelta(days=1)
+        
+        return dates
+    
+    def _validate_request_is_available(self, request_id: str) -> bool:
+        """Check if a request ID is still valid and accessible"""
+        try:
+            # Use correct endpoint: analyticsReportRequests (not analyticsRequests)
+            status_url = f"{self.requestor.api_base}/analyticsReportRequests/{request_id}"
+            resp = self.requestor._asc_request('GET', status_url, timeout=30)
+            
+            if resp is None:
+                logger.warning(f"   ⚠️ No response validating request {request_id}")
+                return False
+            
+            if resp.status_code == 200:
+                return True
+            elif resp.status_code == 404:
+                logger.warning(f"   ⚠️ Request {request_id} no longer available (404)")
+                return False
+            else:
+                logger.warning(f"   ⚠️ Request validation returned {resp.status_code}")
+                return False
+        except Exception as e:
+            logger.warning(f"   ⚠️ Request validation error: {e}")
+            return False
+    
+    def create_onetime_request_for_range(self, app_id: str, start_date: str, end_date: str) -> Optional[str]:
+        """
+        Create or reuse ONE_TIME_SNAPSHOT request for date range
+        Saves request ID to registry for future reference
+        
+        Process:
+        1. Try to load request from registry
+        2. Validate it's still accessible
+        3. If not valid or doesn't exist, create new request
+        """
+        try:
+            logger.info(f"📱 Creating ONE_TIME_SNAPSHOT for app {app_id}: {start_date} → {end_date}")
+            
+            # Step 1: Try to load from registry
+            reg_key = f"analytics_requests/registry/app_id={app_id}/one_time_snapshot.json"
+            
+            existing_request_id = None
+            try:
+                resp = self.s3.get_object(Bucket=self.bucket, Key=reg_key)
+                registry = json.load(resp['Body'])
+                existing_request_id = registry.get('request_id')
+                logger.info(f"   ♻️ Found existing request in registry: {existing_request_id}")
+            except:
+                pass
+            
+            # Step 2: Validate existing request or create new one
+            if existing_request_id:
+                if self._validate_request_is_available(existing_request_id):
+                    logger.info(f"   ✅ Using existing request: {existing_request_id}")
+                    request_id = existing_request_id
+                else:
+                    logger.info(f"   🔄 Existing request no longer valid, creating new one")
+                    request_id = self.requestor.create_or_reuse_one_time_request(app_id, start_date, end_date)
+            else:
+                # Step 3: Create new request
+                request_id = self.requestor.create_or_reuse_one_time_request(app_id, start_date, end_date)
+            
+            if request_id:
+                logger.info(f"   ✅ Request ID: {request_id}")
+                self.results['request_ids'][app_id] = {
+                    'request_id': request_id,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'created_at': datetime.now(timezone.utc).isoformat()
+                }
+                return request_id
+            else:
+                logger.error(f"   ❌ Failed to create ONE_TIME_SNAPSHOT request")
+                self.results['errors'].append(f"Failed to create request for {app_id}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"   ❌ Exception creating request: {e}")
+            self.results['errors'].append(str(e))
+            import traceback
+            traceback.print_exc()
+            return None
     
     # =========================================================================
     # EXTRACT PHASE - Using proven logic from daily_etl.py
@@ -146,17 +259,26 @@ class UnifiedETL:
                     report_id = report['id']
                     report_name = report['attributes']['name']
                     
-                    # Get instances for this report
+                    # Get instances for this report with DAILY granularity filter
                     instances_url = f"{self.requestor.api_base}/analyticsReports/{report_id}/instances"
-                    inst_response = self.requestor._asc_request('GET', instances_url, timeout=30)
+                    inst_response = self.requestor._asc_request('GET', instances_url, 
+                                                                params={'filter[granularity]': 'DAILY'},
+                                                                timeout=30)
                     
                     if inst_response.status_code != 200:
                         continue
                     
                     instances = inst_response.json().get('data', [])
                     
-                    # Download data from each instance
-                    for instance in instances:
+                    # CRITICAL: Filter instances by target_date to avoid writing wrong data
+                    matching_instances = []
+                    for inst in instances:
+                        processing_date = (inst.get("attributes", {}) or {}).get("processingDate")
+                        if processing_date and processing_date.split("T")[0] == target_date:
+                            matching_instances.append(inst)
+                    
+                    # Download data only from matching instances
+                    for instance in matching_instances:
                         instance_id = instance['id']
                         files, rows = self._download_instance_data(
                             instance_id, app_id, report_name, target_date
@@ -304,6 +426,104 @@ class UnifiedETL:
             return 'reviews'
         else:
             return 'analytics'
+    
+    # =========================================================================
+    # EXTRACT PHASE - ONE_TIME_SNAPSHOT extraction
+    # =========================================================================
+    
+    def _extract_onetime_data(self, app_id: str, request_id: str, target_date: str) -> Dict:
+        """
+        Extract data from ONE_TIME_SNAPSHOT request for specific date
+        
+        Args:
+            app_id: Application ID
+            request_id: ONE_TIME_SNAPSHOT request ID
+            target_date: Target date to extract (YYYY-MM-DD)
+        
+        Returns:
+            Dictionary with extraction results
+        """
+        result = {
+            'app_id': app_id,
+            'request_id': request_id,
+            'date': target_date,
+            'files': 0,
+            'rows': 0,
+            'success': False,
+            'errors': []
+        }
+        
+        try:
+            # Get all reports for this request
+            reports_url = f"{self.requestor.api_base}/analyticsReportRequests/{request_id}/reports"
+            response = self.requestor._asc_request('GET', reports_url, timeout=60)
+            
+            if response is None or response.status_code != 200:
+                result['errors'].append(f"Failed to get reports: {response.status_code if response else 'No response'}")
+                logger.warning(f"   ⚠️ Failed to get reports for {request_id}")
+                return result
+            
+            reports = response.json().get('data', [])
+            logger.info(f"   📊 Found {len(reports)} reports for {target_date}")
+            
+            # Process each report
+            for report in reports:
+                report_id = report['id']
+                report_name = report['attributes']['name']
+                
+                # Get instances for this report (filtered by date)
+                instances_url = f"{self.requestor.api_base}/analyticsReports/{report_id}/instances"
+                inst_response = self.requestor._asc_request('GET', instances_url, timeout=30)
+                
+                if inst_response is None or inst_response.status_code != 200:
+                    continue
+                
+                instances = inst_response.json().get('data', [])
+                
+                # Filter instances by target_date
+                matching_instances = []
+                for instance in instances:
+                    instance_attrs = instance.get('attributes', {})
+                    processing_date = instance_attrs.get('processingDate')
+                    
+                    # Parse date - handle different formats
+                    try:
+                        if processing_date:
+                            instance_date = processing_date.split('T')[0]  # Extract YYYY-MM-DD
+                            if instance_date == target_date:
+                                matching_instances.append(instance)
+                    except:
+                        pass
+                
+                if matching_instances:
+                    logger.info(f"      Found {len(matching_instances)} instances for {report_name}")
+                
+                # Download data from matching instances
+                for instance in matching_instances:
+                    instance_id = instance['id']
+                    files, rows = self._download_instance_data(
+                        instance_id, app_id, report_name, target_date
+                    )
+                    
+                    if files > 0:
+                        result['files'] += files
+                        result['rows'] += rows
+            
+            if result['files'] > 0:
+                result['success'] = True
+                logger.info(f"   ✅ Extracted {result['files']} files, {result['rows']} rows for {target_date}")
+            else:
+                result['success'] = True  # Not an error, just no data for this date
+                logger.info(f"   ℹ️ No data available for {target_date}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"   ❌ Exception extracting data: {e}")
+            result['errors'].append(str(e))
+            import traceback
+            traceback.print_exc()
+            return result
     
     # =========================================================================
     # TRANSFORM PHASE - CSV to Parquet
@@ -493,9 +713,11 @@ class UnifiedETL:
         """Refresh all Athena table partitions"""
         result = {'tables_refreshed': 0, 'errors': []}
         
+        # Only refresh tables that we actually curate
+        # Note: curated_reviews removed since 'reviews' is not in transform data_types
         tables = [
             'curated_downloads', 'curated_engagement', 'curated_sessions',
-            'curated_installs', 'curated_purchases', 'curated_reviews'
+            'curated_installs', 'curated_purchases'
         ]
         
         logger.info("🔄 Refreshing Athena partitions...")
@@ -519,49 +741,116 @@ class UnifiedETL:
     # =========================================================================
     
     def run(self, target_date: Optional[str] = None, app_id: Optional[str] = None,
-            backfill_days: int = 0) -> Dict:
-        """Run the complete ETL pipeline"""
+            backfill_days: int = 0, onetime: bool = False, start_date: Optional[str] = None,
+            end_date: Optional[str] = None) -> Dict:
+        """
+        Run the complete ETL pipeline
+        
+        Args:
+            target_date: Single date for ONGOING mode (YYYY-MM-DD)
+            app_id: Specific app ID to process
+            backfill_days: Number of days to backfill (ONGOING mode)
+            onetime: Enable ONE_TIME_SNAPSHOT mode
+            start_date: Start date for ONE_TIME_SNAPSHOT (YYYY-MM-DD)
+            end_date: End date for ONE_TIME_SNAPSHOT (YYYY-MM-DD)
+        """
         print("=" * 80)
         print("🍎 APPLE ANALYTICS - UNIFIED ETL PIPELINE")
         print("=" * 80)
         
-        # Determine dates
-        if target_date:
-            base_date = datetime.strptime(target_date, '%Y-%m-%d')
-        else:
-            base_date = datetime.now(timezone.utc) - timedelta(days=1)
-        
-        if backfill_days > 0:
-            dates = [(base_date - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(backfill_days)]
-        else:
-            dates = [base_date.strftime('%Y-%m-%d')]
-        
         app_ids = self.get_app_ids(app_id)
         
-        print(f"📅 Dates: {len(dates)} ({dates[-1]} to {dates[0]})")
-        print(f"📱 Apps: {len(app_ids)}")
-        print("=" * 80)
-        
-        # Process each date
-        for date_str in dates:
+        # ONE_TIME_SNAPSHOT MODE
+        if onetime:
+            if not start_date or not end_date:
+                raise ValueError("ONE_TIME_SNAPSHOT mode requires --start-date and --end-date")
+            
+            print(f"📊 Mode: ONE_TIME_SNAPSHOT (Bulk Backfill)")
+            print(f"📅 Date Range: {start_date} to {end_date}")
+            print(f"📱 Apps: {len(app_ids)}")
+            print("=" * 80)
+            
+            # Store date range info in results
+            self.results['mode'] = 'ONE_TIME_SNAPSHOT'
+            self.results['start_date'] = start_date
+            self.results['end_date'] = end_date
+            
+            dates = self.generate_date_range(start_date, end_date)
+            
+            # Create requests and extract for each app
+            for aid in app_ids:
+                request_id = self.create_onetime_request_for_range(aid, start_date, end_date)
+                if not request_id:
+                    logger.error(f"Failed to create request for app {aid}, skipping")
+                    continue
+                
+                # EXTRACT phase - process each date in range
+                print(f"\n{'='*60}")
+                print(f"🔄 PHASE 1: EXTRACT - App {aid}")
+                print(f"{'='*60}")
+                
+                for date_str in dates:
+                    try:
+                        result = self._extract_onetime_data(aid, request_id, date_str)
+                        self.results['apps_processed'] += 1
+                        if result['success']:
+                            self.results['apps_successful'] += 1
+                            self.results['files_extracted'] += result['files']
+                    except Exception as e:
+                        logger.error(f"Error extracting {aid}/{date_str}: {e}")
+                        self.results['errors'].append(f"{aid}/{date_str}: {str(e)}")
+            
+            # TRANSFORM phase - process all dates in range
             print(f"\n{'='*60}")
-            print(f"📆 Processing: {date_str}")
+            print(f"🔄 PHASE 2: TRANSFORM")
             print(f"{'='*60}")
             
-            # EXTRACT
-            print("\n🔄 PHASE 1: EXTRACT")
-            for aid in app_ids:
-                result = self.extract_app_data(aid, date_str)
-                self.results['apps_processed'] += 1
-                if result['success']:
-                    self.results['apps_successful'] += 1
-                    self.results['files_extracted'] += result['files']
+            for date_str in dates:
+                transform_result = self.transform_to_parquet(date_str)
+                self.results['files_curated'] += transform_result['files']
+                self.results['total_rows'] += transform_result['rows']
+        
+        # ONGOING MODE (DEFAULT)
+        else:
+            print(f"📊 Mode: ONGOING (Daily Automation)")
             
-            # TRANSFORM
-            print("\n🔄 PHASE 2: TRANSFORM")
-            transform_result = self.transform_to_parquet(date_str)
-            self.results['files_curated'] += transform_result['files']
-            self.results['total_rows'] += transform_result['rows']
+            # Determine dates
+            if target_date:
+                base_date = datetime.strptime(target_date, '%Y-%m-%d')
+            else:
+                base_date = datetime.now(timezone.utc) - timedelta(days=1)
+            
+            if backfill_days > 0:
+                dates = [(base_date - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(backfill_days)]
+            else:
+                dates = [base_date.strftime('%Y-%m-%d')]
+            
+            print(f"📅 Dates: {len(dates)} ({dates[-1]} to {dates[0]})")
+            print(f"📱 Apps: {len(app_ids)}")
+            print("=" * 80)
+            
+            self.results['mode'] = 'ONGOING'
+            
+            # Process each date
+            for date_str in dates:
+                print(f"\n{'='*60}")
+                print(f"📆 Processing: {date_str}")
+                print(f"{'='*60}")
+                
+                # EXTRACT
+                print("\n🔄 PHASE 1: EXTRACT")
+                for aid in app_ids:
+                    result = self.extract_app_data(aid, date_str)
+                    self.results['apps_processed'] += 1
+                    if result['success']:
+                        self.results['apps_successful'] += 1
+                        self.results['files_extracted'] += result['files']
+                
+                # TRANSFORM
+                print("\n🔄 PHASE 2: TRANSFORM")
+                transform_result = self.transform_to_parquet(date_str)
+                self.results['files_curated'] += transform_result['files']
+                self.results['total_rows'] += transform_result['rows']
         
         # LOAD
         print("\n🔄 PHASE 3: LOAD")
@@ -593,11 +882,20 @@ class UnifiedETL:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Apple Analytics Unified ETL')
-    parser.add_argument('--date', type=str, help='Target date (YYYY-MM-DD)')
+    parser = argparse.ArgumentParser(description='Apple Analytics Unified ETL - ONGOING and ONE_TIME_SNAPSHOT modes')
+    
+    # ONGOING mode arguments
+    parser.add_argument('--date', type=str, help='Target date for ONGOING mode (YYYY-MM-DD)')
     parser.add_argument('--app-id', type=str, help='Specific app ID')
-    parser.add_argument('--backfill', action='store_true', help='Backfill mode')
-    parser.add_argument('--days', type=int, default=30, help='Days to backfill')
+    parser.add_argument('--backfill', action='store_true', help='Backfill mode (ONGOING)')
+    parser.add_argument('--days', type=int, default=30, help='Days to backfill (ONGOING mode)')
+    
+    # ONE_TIME_SNAPSHOT mode arguments
+    parser.add_argument('--onetime', action='store_true', help='Enable ONE_TIME_SNAPSHOT mode (requires --start-date and --end-date)')
+    parser.add_argument('--start-date', type=str, help='Start date for ONE_TIME_SNAPSHOT (YYYY-MM-DD)')
+    parser.add_argument('--end-date', type=str, help='End date for ONE_TIME_SNAPSHOT (YYYY-MM-DD)')
+    
+    # Other arguments
     parser.add_argument('--transform-only', action='store_true', help='Only run transform phase (skip extract)')
     parser.add_argument('--load-only', action='store_true', help='Only run load phase (refresh Athena partitions)')
     
@@ -624,7 +922,10 @@ def main():
         etl.run(
             target_date=args.date,
             app_id=args.app_id,
-            backfill_days=args.days if args.backfill else 0
+            backfill_days=args.days if args.backfill else 0,
+            onetime=args.onetime,
+            start_date=args.start_date,
+            end_date=args.end_date
         )
 
 
