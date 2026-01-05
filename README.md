@@ -1,10 +1,10 @@
 # 🍎 Apple Analytics ETL Pipeline
 
 > **Status**: ✅ Production Ready  
-> **Last Updated**: December 2025  
+> **Last Updated**: December 1, 2025  
 > **Apps**: 92 configured | 74 with active data
 
-Automated ETL pipeline for extracting Apple App Store Connect Analytics data and loading it into AWS Athena. Supports both **daily automation** (ONGOING requests) and **historical backfill** (ONE_TIME_SNAPSHOT requests) in a single unified script.
+Automated ETL pipeline for extracting Apple App Store Connect Analytics data and loading it into AWS Athena.
 
 ---
 
@@ -14,25 +14,16 @@ Automated ETL pipeline for extracting Apple App Store Connect Analytics data and
 # 1. Navigate to directory
 cd /Users/ankit_chauhan/Desktop/PlayGroundS/Download_Pipeline/Apple-Analytics
 
-# 2. Activate virtual env| Date | Version | Changes |
-|------|---------|---------|
-| 2025-12-21 | v3.1 | **Unified ETL Integration**: Merged ONE_TIME_SNAPSHOT support into `unified_etl.py`. Single script now supports both ONGOING (daily) and ONE_TIME_SNAPSHOT (backfill) modes via `--onetime` flag. Removed separate `unified_onetime_etl.py`. |
-| 2025-12-20 | v3.0 | Added ONE_TIME_SNAPSHOT support, comprehensive S3/Athena documentation, expanded query examples |
-| 2025-12-01 | v2.0 | Fixed deduplication, consolidated docs, repository cleanup, 6 data types |
-| 2025-11-28 | v1.5 | Unified ETL script, cron automation at 6 AM |
-| 2025-11-27 | v1.0 | Initial production deployment |nt
+# 2. Activate virtual environment
 source ../.venv/bin/activate
 
 # 3. Run ETL (extracts yesterday's data for all 92 apps)
 python3 unified_etl.py
-
-# 4. Historical backfill (ONE_TIME_SNAPSHOT)
-python3 unified_etl.py --onetime --start-date 2025-11-01 --end-date 2025-11-30
 ```
 
 ---
 
-## 📊 Current Status (December 2025)
+## 📊 Current Status (December 1, 2025)
 
 | Athena Table | Rows | Apps | Status |
 |--------------|------|------|--------|
@@ -48,7 +39,8 @@ python3 unified_etl.py --onetime --start-date 2025-11-01 --end-date 2025-11-30
 
 ```
 Apple-Analytics/
-├── unified_etl.py               # 🔑 Unified ETL (ONGOING + ONE_TIME_SNAPSHOT)
+├── unified_etl.py               # 🔑 Daily ETL (ONGOING requests, daily data)
+├── unified_onetime_etl.py       # 📅 Backfill ETL (ONE_TIME_SNAPSHOT requests)
 ├── daily_cron.sh                # Cron wrapper for daily automation (6 AM)
 ├── startup_verification.sh      # Health check script
 ├── .env                         # Configuration (not in git)
@@ -106,21 +98,24 @@ python3 unified_etl.py --transform-only --date 2025-12-20
 # Load only (refresh Athena partitions)
 python3 unified_etl.py --load-only
 
-# Backfill last N days (using ONGOING requests)
+# Backfill last N days
 python3 unified_etl.py --backfill --days 30
 ```
 
 ### Manual Commands - ONE_TIME_SNAPSHOT Backfill
 
 ```bash
-# One-time snapshot for specific date range (all apps)
-python3 unified_etl.py --onetime --start-date 2025-11-01 --end-date 2025-11-30
+# One-time snapshot for specific date range
+python3 unified_onetime_etl.py --start-date 2025-11-01 --end-date 2025-11-30
 
 # One-time snapshot for specific app
-python3 unified_etl.py --onetime --app-id 1506886061 --start-date 2025-11-01 --end-date 2025-11-05
+python3 unified_onetime_etl.py --app-id 1506886061 --start-date 2025-11-01 --end-date 2025-11-05
 
 # One-time snapshot for all apps, specific range
-python3 unified_etl.py --onetime --start-date 2025-11-15 --end-date 2025-11-20
+python3 unified_onetime_etl.py --start-date 2025-11-15 --end-date 2025-11-20
+
+# Dry run (check what would be processed)
+python3 unified_onetime_etl.py --start-date 2025-11-01 --end-date 2025-11-05 --dry-run
 ```
 
 ### Verification
@@ -129,8 +124,11 @@ python3 unified_etl.py --onetime --start-date 2025-11-15 --end-date 2025-11-20
 # Run health check
 ./startup_verification.sh
 
-# Check ETL logs
+# Check daily ETL logs
 tail -f logs/unified_etl_$(date +%Y%m%d).log
+
+# Check backfill ETL logs
+tail -f logs/unified_onetime_etl_$(date +%Y%m%d).log
 
 # Verify cron is set up
 crontab -l | grep "unified_etl"
@@ -147,14 +145,12 @@ crontab -l | grep "unified_etl"
 └─────────┬──────────┘
           │
     ┌─────▼──────────────────────────────────────────┐
-    │         unified_etl.py                         │
-    │   Request Type Selection (via CLI flags)       │
+    │         Request Type Selection                 │
     └─────┬────────────────────┬────────────────────┘
           │                    │
     ┌─────▼──────┐       ┌─────▼──────┐
     │  ONGOING   │       │ ONE_TIME   │
-    │ (Daily)    │       │ (--onetime)│
-    │ Default    │       │ Backfill   │
+    │ (Daily)    │       │ (Backfill) │
     └─────┬──────┘       └─────┬──────┘
           │                    │
     ┌─────▼────────────────────▼─────────────┐
@@ -168,12 +164,13 @@ crontab -l | grep "unified_etl"
     └─────┬────────────────────────────────────┘
           │
     ┌─────▼─────────────────────────────────┐
-    │  Load to Athena Tables (5 types)      │
+    │  Load to Athena Tables (6 types)      │
     │  - curated_downloads                  │
     │  - curated_engagement                 │
     │  - curated_sessions                   │
     │  - curated_installs                   │
     │  - curated_purchases                  │
+    │  - curated_reviews                    │
     └───────────────────────────────────────┘
 ```
 
@@ -573,8 +570,7 @@ ORDER BY metric_date DESC;
 
 | Date | Version | Changes |
 |------|---------|---------|
-| 2025-12-21 | v3.1 | **Unified ETL Integration**: Merged ONE_TIME_SNAPSHOT support into `unified_etl.py`. Single script now handles both ONGOING (daily) and ONE_TIME_SNAPSHOT (backfill) via `--onetime` flag. |
-| 2025-12-20 | v3.0 | Added ONE_TIME_SNAPSHOT support, comprehensive S3/Athena documentation, expanded query examples |
+| 2025-12-20 | v3.0 | Added `unified_onetime_etl.py` for ONE_TIME_SNAPSHOT backfills, comprehensive S3/Athena documentation, expanded query examples |
 | 2025-12-01 | v2.0 | Fixed deduplication, consolidated docs, repository cleanup, 6 data types |
 | 2025-11-28 | v1.5 | Unified ETL script, cron automation at 6 AM |
 | 2025-11-27 | v1.0 | Initial production deployment |
@@ -584,7 +580,8 @@ ORDER BY metric_date DESC;
 ## 🔗 Related Documentation
 
 - **[COMPLETE_PIPELINE_DOCUMENTATION.md](./COMPLETE_PIPELINE_DOCUMENTATION.md)** - Full architecture, deduplication logic, troubleshooting
-- **[unified_etl.py](./unified_etl.py)** - Unified ETL script for daily and backfill requests
+- **[unified_onetime_etl.py](./unified_onetime_etl.py)** - ONE_TIME_SNAPSHOT ETL script for backfills
+- **[unified_etl.py](./unified_etl.py)** - Daily ETL script using ONGOING requests
 
 ---
 
@@ -616,6 +613,9 @@ ORDER BY metric_date DESC;
 ```bash
 # Daily ETL logs
 tail -f logs/unified_etl_$(date +%Y%m%d).log
+
+# Backfill ETL logs
+tail -f logs/unified_onetime_etl_$(date +%Y%m%d).log
 
 # Recent errors
 grep -i "error\|failed\|409" logs/unified_etl_*.log | tail -20
