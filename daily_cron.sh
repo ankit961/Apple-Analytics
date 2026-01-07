@@ -15,8 +15,8 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 LOG_DIR="${SCRIPT_DIR}/logs"
 DATE=$(date +%Y-%m-%d)
+DATE_COMPACT=$(date +%Y%m%d)
 START_TIME=$(date +%s)
-RESULTS_FILE="${LOG_DIR}/etl_results_${DATE}.json"
 
 # Create log directory
 mkdir -p "$LOG_DIR"
@@ -88,7 +88,7 @@ send_slack_notification() {
                     "elements": [
                         {
                             "type": "mrkdwn",
-                            "text": "Server: EC2 Production | Date: ${DATE} | Time: $(date '+%H:%M:%S %Z')"
+                            "text": "Server: EC2 Production | Date: ${DATE} | Time: $(date '+%H:%M:%S UTC')"
                         }
                     ]
                 }
@@ -105,35 +105,44 @@ EOF
 }
 
 # =============================================================================
-# Parse Results JSON
+# Parse Results JSON - Find the latest results file for today
 # =============================================================================
 parse_results() {
-    if [ -f "$RESULTS_FILE" ]; then
-        # Extract values using Python (more reliable than jq)
-        PYTHON_CMD="/home/ec2-user/anaconda3/bin/python3"
-        if [ ! -f "$PYTHON_CMD" ]; then
-            PYTHON_CMD="python3"
-        fi
-        
-        STATS=$($PYTHON_CMD -c "
+    # Find the latest results file for today (pattern: unified_etl_results_YYYYMMDD_*.json)
+    RESULTS_FILE=$(ls -t ${LOG_DIR}/unified_etl_results_${DATE_COMPACT}_*.json 2>/dev/null | head -1)
+    
+    if [ -z "$RESULTS_FILE" ] || [ ! -f "$RESULTS_FILE" ]; then
+        echo "No results file found for today: ${DATE_COMPACT}"
+        return 1
+    fi
+    
+    echo "Parsing results from: $RESULTS_FILE"
+    
+    # Extract values using Python (more reliable than jq)
+    PYTHON_CMD="/home/ec2-user/anaconda3/bin/python3"
+    if [ ! -f "$PYTHON_CMD" ]; then
+        PYTHON_CMD="python3"
+    fi
+    
+    STATS=$($PYTHON_CMD -c "
 import json
 try:
     with open('$RESULTS_FILE', 'r') as f:
         data = json.load(f)
-    summary = data.get('summary', {})
-    print(f\"APPS_PROCESSED={summary.get('total_apps', 0)}\")
-    print(f\"APPS_SUCCESS={summary.get('successful_apps', 0)}\")
-    print(f\"APPS_FAILED={summary.get('failed_apps', 0)}\")
-    print(f\"FILES_EXTRACTED={summary.get('total_files_extracted', 0)}\")
-    print(f\"FILES_CURATED={summary.get('total_files_curated', 0)}\")
-    print(f\"TOTAL_ROWS={summary.get('total_rows', 0)}\")
+    # Keys are at root level, not under 'summary'
+    print(f\"APPS_PROCESSED={data.get('apps_processed', 0)}\")
+    print(f\"APPS_SUCCESS={data.get('apps_successful', 0)}\")
+    print(f\"APPS_FAILED={data.get('apps_processed', 0) - data.get('apps_successful', 0)}\")
+    print(f\"FILES_EXTRACTED={data.get('files_extracted', 0)}\")
+    print(f\"FILES_CURATED={data.get('files_curated', 0)}\")
+    print(f\"TOTAL_ROWS={data.get('total_rows', 0)}\")
     print(f\"ERRORS={len(data.get('errors', []))}\")
 except Exception as e:
     print(f'PARSE_ERROR={e}')
-" 2>/dev/null)
-        
-        eval "$STATS"
-    fi
+" 2>&1)
+    
+    echo "Parse output: $STATS"
+    eval "$STATS"
 }
 
 # =============================================================================
