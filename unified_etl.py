@@ -355,7 +355,11 @@ class UnifiedETL:
         return result
     
     def _curate_app_data(self, data_type: str, app_id: str, target_date: str) -> int:
-        """Curate data for a specific app/type/date"""
+        """Curate data for a specific app/type/date
+        
+        Key fix: Partitions curated data by actual metric_date (from data),
+        not by processingDate (when Apple made data available).
+        """
         prefix = f'appstore/raw/{data_type}/dt={target_date}/app_id={app_id}/'
         
         dfs = []
@@ -382,20 +386,33 @@ class UnifiedETL:
         if curated is None or curated.empty:
             return 0
         
-        # Save as Parquet
-        output_key = f'appstore/curated/{data_type}/dt={target_date}/app_id={app_id}/data.parquet'
-        buffer = io.BytesIO()
-        curated.to_parquet(buffer, engine='pyarrow', compression='snappy', index=False)
-        buffer.seek(0)
+        # Group by metric_date and write separate parquet files for each date
+        # This ensures dt partition matches the actual metric date, not processing date
+        total_rows = 0
+        for metric_date_val, date_group in curated.groupby('dt'):
+            output_key = f'appstore/curated/{data_type}/dt={metric_date_val}/app_id={app_id}/data.parquet'
+            buffer = io.BytesIO()
+            date_group.to_parquet(buffer, engine='pyarrow', compression='snappy', index=False)
+            buffer.seek(0)
+            
+            self.s3.put_object(Bucket=self.bucket, Key=output_key, Body=buffer.getvalue())
+            total_rows += len(date_group)
+            logger.debug(f"      Wrote {len(date_group)} rows to dt={metric_date_val}")
         
-        self.s3.put_object(Bucket=self.bucket, Key=output_key, Body=buffer.getvalue())
-        return len(curated)
+        return total_rows
     
     def _transform_dataframe(self, data_type: str, df: pd.DataFrame, app_id: str, target_date: str) -> Optional[pd.DataFrame]:
-        """Transform raw DataFrame to curated schema with proper deduplication"""
+        """Transform raw DataFrame to curated schema with proper deduplication
+        
+        Key fix: Sets dt partition to actual metric_date (from data), not processingDate.
+        Adds processing_date column for audit trail.
+        """
         try:
             # First, deduplicate raw data (Apple sometimes provides overlapping segments)
             df = df.drop_duplicates()
+            
+            # Convert metric_date once - this is the actual date of the metrics
+            metric_dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
             
             if data_type == 'downloads':
                 curated = pd.DataFrame({
@@ -409,12 +426,13 @@ class UnifiedETL:
                     'device': df.get('Device', ''),
                     'platform_version': df.get('Platform Version', ''),
                     'app_id_part': int(app_id),
-                    'dt': target_date
+                    'processing_date': target_date,  # When Apple made data available
+                    'dt': metric_dates  # Partition by actual metric date
                 })
                 curated = curated[curated['total_downloads'] > 0]
                 # Aggregate by all dimensions, sum metrics
                 group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'download_type', 
-                              'source_type', 'device', 'platform_version', 'app_id_part', 'dt']
+                              'source_type', 'device', 'platform_version', 'app_id_part', 'processing_date', 'dt']
                 return curated.groupby(group_cols, as_index=False).agg({'total_downloads': 'sum'})
                 
             elif data_type == 'engagement':
@@ -427,10 +445,11 @@ class UnifiedETL:
                     'source_type': df.get('Source Type', ''),
                     'device': df.get('Device', ''),
                     'app_id_part': int(app_id),
-                    'dt': target_date
+                    'processing_date': target_date,
+                    'dt': metric_dates
                 })
                 curated = curated[curated['impressions'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'source_type', 'device', 'app_id_part', 'dt']
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'source_type', 'device', 'app_id_part', 'processing_date', 'dt']
                 return curated.groupby(group_cols, as_index=False).agg({'impressions': 'sum'})
                 
             elif data_type == 'sessions':
@@ -442,10 +461,11 @@ class UnifiedETL:
                     'sessions': pd.to_numeric(df.get('Sessions', df.get('Counts', 0)), errors='coerce').fillna(0).astype('int64'),
                     'device': df.get('Device', ''),
                     'app_id_part': int(app_id),
-                    'dt': target_date
+                    'processing_date': target_date,
+                    'dt': metric_dates
                 })
                 curated = curated[curated['sessions'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'device', 'app_id_part', 'dt']
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'device', 'app_id_part', 'processing_date', 'dt']
                 return curated.groupby(group_cols, as_index=False).agg({'sessions': 'sum'})
                 
             elif data_type == 'installs':
@@ -458,10 +478,11 @@ class UnifiedETL:
                     'event': df.get('Event', ''),
                     'device': df.get('Device', ''),
                     'app_id_part': int(app_id),
-                    'dt': target_date
+                    'processing_date': target_date,
+                    'dt': metric_dates
                 })
                 curated = curated[curated['counts'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'event', 'device', 'app_id_part', 'dt']
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'event', 'device', 'app_id_part', 'processing_date', 'dt']
                 return curated.groupby(group_cols, as_index=False).agg({'counts': 'sum'})
                 
             elif data_type == 'purchases':
@@ -474,10 +495,11 @@ class UnifiedETL:
                     'proceeds_usd': pd.to_numeric(df.get('Proceeds in USD', 0), errors='coerce').fillna(0.0),
                     'device': df.get('Device', ''),
                     'app_id_part': int(app_id),
-                    'dt': target_date
+                    'processing_date': target_date,
+                    'dt': metric_dates
                 })
                 curated = curated[curated['purchases'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'device', 'app_id_part', 'dt']
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'device', 'app_id_part', 'processing_date', 'dt']
                 return curated.groupby(group_cols, as_index=False).agg({'purchases': 'sum', 'proceeds_usd': 'sum'})
             
             return None
