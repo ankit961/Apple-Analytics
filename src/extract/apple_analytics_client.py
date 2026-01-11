@@ -12,7 +12,7 @@ import json
 import time
 import logging
 from datetime import datetime, timedelta, date, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import requests
 import boto3
 import jwt
@@ -197,8 +197,13 @@ class AppleAnalyticsRequestor:
         except Exception as e:
             logger.warning("Failed to save registry: %s", e)
     
-    def _load_request_registry(self, app_id: str, access_type: str = "ONE_TIME_SNAPSHOT") -> Optional[str]:
-        """Load request ID from S3 registry"""
+    def _load_request_registry(self, app_id: str, access_type: str = "ONE_TIME_SNAPSHOT") -> Optional[Dict]:
+        """
+        Load request ID and metadata from S3 registry
+        
+        Returns:
+            Dict with 'request_id', 'created_at', 'access_type' or None
+        """
         key = self._registry_key_for_app(app_id, access_type)
         
         try:
@@ -206,8 +211,9 @@ class AppleAnalyticsRequestor:
             data = json.loads(obj["Body"].read().decode("utf-8"))
             rid = data.get("request_id")
             if rid:
-                logger.info("📖 Loaded registry for app %s: %s", app_id, rid)
-                return rid
+                logger.info("📖 Loaded registry for app %s: %s (created: %s)", 
+                          app_id, rid, data.get("created_at", "unknown"))
+                return data
         except ClientError as e:
             if e.response["Error"]["Code"] != "NoSuchKey":
                 logger.warning("Registry load error: %s", e)
@@ -215,6 +221,33 @@ class AppleAnalyticsRequestor:
             logger.warning("Registry load exception: %s", e)
         
         return None
+    
+    def _should_trust_registry(self, registry_data: Dict, max_age_days: int = 30) -> bool:
+        """
+        Determine if we should trust the registry without verification
+        
+        ONGOING requests don't expire, so we can trust them if:
+        - Created within max_age_days (default 30)
+        - This avoids unnecessary API calls
+        """
+        created_at_str = registry_data.get("created_at")
+        if not created_at_str:
+            return False
+        
+        try:
+            created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+            age = datetime.now(timezone.utc) - created_at
+            
+            # Trust if less than max_age_days old
+            if age.days < max_age_days:
+                logger.info(f"✅ Registry is {age.days} days old, trusting without verification")
+                return True
+            else:
+                logger.info(f"⚠️ Registry is {age.days} days old, will verify")
+                return False
+        except Exception as e:
+            logger.warning(f"⚠️ Error parsing registry age: {e}")
+            return False
     
     def _extract_request_id_from_analytics_json(self, app_id: str) -> Optional[str]:
         """Extract request ID from existing analytics.json files as fallback"""
@@ -262,66 +295,44 @@ class AppleAnalyticsRequestor:
         """
         Create ONGOING request or reuse existing via S3 registry.
         ONGOING requests are preferred for daily ETL as they don't expire.
+        
+        OPTIMIZATIONS:
+        - Trust registry if created within 30 days (skip verification)
+        - Handle 429 rate limits gracefully (don't treat as invalid)
+        - Implement exponential backoff for retries
         """
         # 1) Check S3 registry first
-        existing_rid = self._load_request_registry(app_id, "ONGOING")
-        if existing_rid:
-            # Verify it's still valid
-            if self._verify_request_exists(existing_rid):
-                logger.info("♻️ Reusing ONGOING request from registry: %s", existing_rid)
+        registry_data = self._load_request_registry(app_id, "ONGOING")
+        if registry_data:
+            existing_rid = registry_data.get("request_id")
+            
+            # OPTIMIZATION: Trust registry without verification if recent
+            if self._should_trust_registry(registry_data, max_age_days=30):
+                logger.info("♻️ Trusting recent registry (skip verification): %s", existing_rid)
+                return existing_rid
+            
+            # Verify it's still valid (with proper 429 handling)
+            is_valid, reason = self._verify_request_exists(existing_rid, skip_on_rate_limit=True)
+            if is_valid:
+                logger.info("♻️ Reusing ONGOING request from registry: %s (%s)", existing_rid, reason)
                 return existing_rid
             else:
-                logger.info("⚠️ Registry ONGOING request %s is invalid, will create new", existing_rid)
+                if reason == 'rate_limited':
+                    # Rate limited, but we'll trust the registry anyway
+                    logger.warning("⚠️ Verification rate limited, trusting registry: %s", existing_rid)
+                    return existing_rid
+                else:
+                    logger.info("⚠️ Registry ONGOING request %s is invalid (%s), will create new", existing_rid, reason)
         
-        # 2) Check Apple API for existing ONGOING request
-        existing_rid = self._find_existing_ongoing_request(app_id)
+        # 2) Check Apple API for existing ONGOING request (with retry on 429)
+        existing_rid = self._find_existing_ongoing_request_with_retry(app_id)
         if existing_rid:
             # Save to registry for future use
             self._save_request_registry(app_id, "ONGOING", existing_rid)
             return existing_rid
         
-        # 3) Create new ONGOING request
-        payload = {
-            "data": {
-                "type": "analyticsReportRequests",
-                "attributes": {"accessType": "ONGOING"},
-                "relationships": {"app": {"data": {"type": "apps", "id": str(app_id)}}}
-            }
-        }
-        
-        url = f"{self.api_base}/analyticsReportRequests"
-        logger.info("Creating ONGOING request for app %s", app_id)
-        
-        try:
-            response = self._asc_request('POST', url, json=payload, timeout=60)
-            
-            if response.status_code == 201:
-                rid = response.json()["data"]["id"]
-                logger.info("✅ Created ONGOING: %s", rid)
-                
-                # Save to registry for future reuse
-                self._save_request_registry(app_id, "ONGOING", rid)
-                return rid
-                
-            elif response.status_code == 409:
-                logger.info("♻️ ONGOING already exists (409). Looking up...")
-                
-                # Try to find it via API
-                existing_rid = self._find_existing_ongoing_request(app_id)
-                if existing_rid:
-                    self._save_request_registry(app_id, "ONGOING", existing_rid)
-                    return existing_rid
-                    
-                logger.error("409 conflict but could not find existing ONGOING request")
-                return None
-                
-            else:
-                logger.error("❌ Create ONGOING failed %s: %s", response.status_code, response.text[:600])
-                return None
-                
-        except Exception as e:
-            logger.error("❌ Exception creating ONGOING request: %s", e)
-            return None
+        # 3) Create new ONGOING request (with retry on 429)
+        return self._create_ongoing_request_with_retry(app_id)
     
     def _find_existing_ongoing_request(self, app_id: str) -> Optional[str]:
         """Find existing ONGOING request via Apple API"""
@@ -349,14 +360,148 @@ class AppleAnalyticsRequestor:
         
         return None
     
-    def _verify_request_exists(self, request_id: str) -> bool:
-        """Verify a request ID is still valid"""
+    def _find_existing_ongoing_request_with_retry(self, app_id: str, max_retries: int = 3) -> Optional[str]:
+        """
+        Find existing ONGOING request with exponential backoff on 429
+        """
+        for attempt in range(max_retries):
+            try:
+                url = f"{self.api_base}/apps/{app_id}/analyticsReportRequests"
+                params = {"filter[accessType]": "ONGOING"}
+                
+                response = self._asc_request('GET', url, params=params, timeout=30)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    requests_list = data.get('data', [])
+                    
+                    if requests_list:
+                        rid = requests_list[0]['id']
+                        logger.info("🔍 Found existing ONGOING request: %s", rid)
+                        return rid
+                    return None
+                    
+                elif response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 5  # 5, 10, 20 seconds
+                        logger.warning(f"⚠️ Rate limited finding ONGOING (attempt {attempt+1}/{max_retries}), waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ Rate limited after {max_retries} attempts")
+                        return None
+                        
+                elif response.status_code == 403:
+                    logger.warning("⚠️ 403 Forbidden when listing requests")
+                    return None
+                else:
+                    logger.warning("⚠️ List requests failed: %s", response.status_code)
+                    return None
+                    
+            except Exception as e:
+                logger.warning("⚠️ Exception finding ONGOING request: %s", e)
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 5
+                    time.sleep(wait_time)
+                    continue
+                return None
+        
+        return None
+    
+    def _create_ongoing_request_with_retry(self, app_id: str, max_retries: int = 3) -> Optional[str]:
+        """
+        Create new ONGOING request with exponential backoff on 429
+        """
+        payload = {
+            "data": {
+                "type": "analyticsReportRequests",
+                "attributes": {"accessType": "ONGOING"},
+                "relationships": {"app": {"data": {"type": "apps", "id": str(app_id)}}}
+            }
+        }
+        
+        url = f"{self.api_base}/analyticsReportRequests"
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Creating ONGOING request for app {app_id}" + (f" (attempt {attempt+1})" if attempt > 0 else ""))
+                
+                response = self._asc_request('POST', url, json=payload, timeout=60)
+                
+                if response.status_code == 201:
+                    rid = response.json()["data"]["id"]
+                    logger.info("✅ Created ONGOING: %s", rid)
+                    
+                    # Save to registry for future reuse
+                    self._save_request_registry(app_id, "ONGOING", rid)
+                    return rid
+                    
+                elif response.status_code == 409:
+                    logger.info("♻️ ONGOING already exists (409). Looking up...")
+                    
+                    # Try to find it via API
+                    existing_rid = self._find_existing_ongoing_request_with_retry(app_id)
+                    if existing_rid:
+                        self._save_request_registry(app_id, "ONGOING", existing_rid)
+                        return existing_rid
+                        
+                    logger.error("409 conflict but could not find existing ONGOING request")
+                    return None
+                    
+                elif response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 5  # 5, 10, 20 seconds
+                        logger.warning(f"⚠️ Rate limited creating ONGOING (attempt {attempt+1}/{max_retries}), waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ Create ONGOING rate limited after {max_retries} attempts")
+                        return None
+                        
+                else:
+                    logger.error("❌ Create ONGOING failed %s: %s", response.status_code, response.text[:600])
+                    return None
+                    
+            except Exception as e:
+                logger.error("❌ Exception creating ONGOING request: %s", e)
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 5
+                    time.sleep(wait_time)
+                    continue
+                return None
+        
+        return None
+    
+    def _verify_request_exists(self, request_id: str, skip_on_rate_limit: bool = True) -> Tuple[bool, str]:
+        """
+        Verify a request ID is still valid
+        
+        Returns:
+            tuple[bool, str]: (is_valid, reason)
+            - (True, 'valid') - Request exists and is valid
+            - (False, 'rate_limited') - Hit 429, can't verify but might be valid
+            - (False, 'not_found') - Request doesn't exist (404)
+            - (False, 'error') - Other error
+        """
         try:
             url = f"{self.api_base}/analyticsReportRequests/{request_id}"
             response = self._asc_request('GET', url, timeout=30)
-            return response.status_code == 200
-        except Exception:
-            return False
+            
+            if response.status_code == 200:
+                return (True, 'valid')
+            elif response.status_code == 429:
+                # Rate limited - we can't verify, but don't assume invalid
+                if skip_on_rate_limit:
+                    logger.warning("⚠️ Rate limited during verification, assuming valid")
+                    return (True, 'rate_limited')  # Assume valid to avoid cascade
+                return (False, 'rate_limited')
+            elif response.status_code == 404:
+                return (False, 'not_found')
+            else:
+                return (False, f'status_{response.status_code}')
+        except Exception as e:
+            logger.warning(f"⚠️ Exception during verification: {e}")
+            return (False, 'error')
 
     def create_or_reuse_one_time_request(self, app_id: str, start_date: str, end_date: str) -> Optional[str]:
         """

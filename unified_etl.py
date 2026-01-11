@@ -72,6 +72,9 @@ class UnifiedETL:
     3. LOAD: Refreshes Athena partitions
     """
     
+    # Apple refines data over 3-4 days, so we look back to get the most complete data
+    LOOKBACK_DAYS = 5
+    
     def __init__(self):
         self.requestor = AppleAnalyticsRequestor()
         self.s3 = boto3.client('s3', region_name='us-east-1')
@@ -324,10 +327,19 @@ class UnifiedETL:
         return result
     
     def _curate_data_type(self, data_type: str, target_date: str) -> Dict:
-        """Curate a specific data type for a date"""
+        """Curate a specific data type for a date
+        
+        NEW APPROACH (based on findings):
+        - Apple's ONGOING requests include ALL historical data in the latest processing date
+        - Each dt folder contains multiple files, each with 2 days of metric data
+        - We read ALL files from the target processing date and deduplicate
+        - Then group by metric_date and write separate curated files
+        """
         result = {'files': 0, 'rows': 0}
         
+        # Find all app_ids that have data for this processing date
         prefix = f'appstore/raw/{data_type}/dt={target_date}/'
+        
         try:
             response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix, Delimiter='/')
             app_prefixes = response.get('CommonPrefixes', [])
@@ -342,7 +354,7 @@ class UnifiedETL:
             app_id = app_path.split('app_id=')[1].rstrip('/')
             
             try:
-                curated_rows = self._curate_app_data(data_type, app_id, target_date)
+                curated_rows = self._curate_app_data_from_processing_date(data_type, app_id, target_date)
                 if curated_rows > 0:
                     result['files'] += 1
                     result['rows'] += curated_rows
@@ -351,14 +363,177 @@ class UnifiedETL:
         
         if result['files'] > 0:
             logger.info(f"   📊 {data_type}: {result['files']} apps, {result['rows']:,} rows")
-        
         return result
     
+    def _curate_app_data_from_processing_date(self, data_type: str, app_id: str, processing_date: str) -> int:
+        """Curate ALL metric dates from a single processing date folder
+        
+        Key findings from data analysis:
+        1. Each processing date folder contains MULTIPLE files (35+ files)
+        2. Each file contains 2 days of metric data
+        3. Files overlap - same metric date appears in multiple files
+        4. We need to read ALL files, deduplicate, and group by metric_date
+        
+        This approach gives us:
+        - Complete historical data (36+ days) from one processing date
+        - Properly deduplicated data
+        - Curated files partitioned by actual metric_date
+        """
+        prefix = f'appstore/raw/{data_type}/dt={processing_date}/app_id={app_id}/'
+        
+        all_dfs = []
+        response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
+        
+        for obj in response.get('Contents', []):
+            if not obj['Key'].endswith('.csv'):
+                continue
+            
+            filename = obj['Key'].split('/')[-1].lower()
+            
+            # Only use STANDARD files (complete data)
+            # Skip DETAILED files (only attributed data, ~15% of total)
+            if 'detailed' in filename or 'performance' in filename:
+                continue
+            
+            try:
+                csv_response = self.s3.get_object(Bucket=self.bucket, Key=obj['Key'])
+                content = csv_response['Body'].read().decode('utf-8')
+                df = pd.read_csv(io.StringIO(content), sep='\t', low_memory=False)
+                if not df.empty:
+                    all_dfs.append(df)
+            except Exception as e:
+                logger.debug(f"Error reading {obj['Key']}: {e}")
+                continue
+        
+        if not all_dfs:
+            return 0
+        
+        # Combine all files and DEDUPLICATE (critical!)
+        combined = pd.concat(all_dfs, ignore_index=True)
+        combined = combined.drop_duplicates()
+        
+        logger.debug(f"      {data_type}/{app_id}: {len(all_dfs)} files, {len(combined):,} rows after dedup")
+        
+        # Transform and write separate files for each metric_date
+        curated = self._transform_dataframe(data_type, combined, app_id, processing_date)
+        
+        if curated is None or curated.empty:
+            return 0
+        
+        # Group by metric_date (dt column) and write separate parquet files
+        total_rows = 0
+        for metric_date_val, date_group in curated.groupby('dt'):
+            output_key = f'appstore/curated/{data_type}/dt={metric_date_val}/app_id={app_id}/data.parquet'
+            buffer = io.BytesIO()
+            date_group.to_parquet(buffer, engine='pyarrow', compression='snappy', index=False)
+            buffer.seek(0)
+            
+            self.s3.put_object(Bucket=self.bucket, Key=output_key, Body=buffer.getvalue())
+            total_rows += len(date_group)
+        
+        logger.debug(f"      Wrote {total_rows:,} rows across {curated['dt'].nunique()} metric dates")
+        return total_rows
+
+    def _curate_app_data_with_lookback(self, data_type: str, app_id: str, metric_date: str) -> int:
+        """Curate data for a specific metric_date, aggregating from multiple processing dates
+        
+        Apple refines data over 3-4 days. For metric_date=Jan 5:
+        - dt=2026-01-05 may have partial data
+        - dt=2026-01-06 has more complete data  
+        - dt=2026-01-07 has refined data
+        - dt=2026-01-09 has final data
+        
+        Strategy: Collect data from all processing dates, keep the LATEST version for each unique key.
+        """
+        base_date = datetime.strptime(metric_date, '%Y-%m-%d')
+        all_dfs = []
+        
+        # Check all processing dates where this metric_date's data might exist
+        for day_offset in range(self.LOOKBACK_DAYS + 1):
+            processing_date = (base_date + timedelta(days=day_offset)).strftime('%Y-%m-%d')
+            prefix = f'appstore/raw/{data_type}/dt={processing_date}/app_id={app_id}/'
+            
+            try:
+                response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
+                
+                for obj in response.get('Contents', []):
+                    if not obj['Key'].endswith('.csv'):
+                        continue
+                    
+                    filename = obj['Key'].split('/')[-1].lower()
+                    
+                    # Only use STANDARD files
+                    if 'detailed' in filename or 'performance' in filename:
+                        continue
+                    
+                    csv_response = self.s3.get_object(Bucket=self.bucket, Key=obj['Key'])
+                    content = csv_response['Body'].read().decode('utf-8')
+                    df = pd.read_csv(io.StringIO(content), sep='\t', low_memory=False)
+                    
+                    if df.empty or 'Date' not in df.columns:
+                        continue
+                    
+                    # Filter to only the metric_date we care about
+                    df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+                    df = df[df['Date'] == metric_date]
+                    
+                    if not df.empty:
+                        df['_processing_date'] = processing_date
+                        all_dfs.append(df)
+                        
+            except Exception as e:
+                logger.debug(f"Error reading from dt={processing_date}: {e}")
+                continue
+        
+        if not all_dfs:
+            return 0
+        
+        # Combine all data and deduplicate, keeping latest processing date
+        combined = pd.concat(all_dfs, ignore_index=True)
+        
+        # Sort by processing_date descending to keep latest data
+        combined = combined.sort_values('_processing_date', ascending=False)
+        
+        # Deduplicate keeping first (latest processing date)
+        # Group by all columns except _processing_date
+        dedup_cols = [c for c in combined.columns if c != '_processing_date']
+        combined = combined.drop_duplicates(subset=dedup_cols, keep='first')
+        
+        # Get the latest processing date used (for audit trail)
+        latest_processing_date = combined['_processing_date'].max()
+        
+        # Remove temp column and transform
+        combined = combined.drop(columns=['_processing_date'])
+        curated = self._transform_dataframe(data_type, combined, app_id, latest_processing_date)
+        
+        if curated is None or curated.empty:
+            return 0
+        
+        # Write to S3 - curated path uses metric_date as partition
+        output_key = f'appstore/curated/{data_type}/dt={metric_date}/app_id={app_id}/data.parquet'
+        buffer = io.BytesIO()
+        curated.to_parquet(buffer, engine='pyarrow', compression='snappy', index=False)
+        buffer.seek(0)
+        
+        self.s3.put_object(Bucket=self.bucket, Key=output_key, Body=buffer.getvalue())
+        logger.debug(f"      Wrote {len(curated)} rows to dt={metric_date} (from processing_date={latest_processing_date})")
+        
+        return len(curated)
+
     def _curate_app_data(self, data_type: str, app_id: str, target_date: str) -> int:
         """Curate data for a specific app/type/date
         
-        Key fix: Partitions curated data by actual metric_date (from data),
-        not by processingDate (when Apple made data available).
+        Key fixes:
+        1. Uses STANDARD files only (complete data, not just attributed)
+        2. Partitions curated data by actual metric_date (from data),
+           not by processingDate (when Apple made data available)
+        
+        File mapping:
+        - downloads: app_downloads_standard_*.csv
+        - installs: app_store_installation_and_deletion_standard_*.csv
+        - engagement: app_store_discovery_and_engagement_standard_*.csv
+        - sessions: app_sessions_standard_*.csv
+        - purchases: app_store_purchases_standard_*.csv
         """
         prefix = f'appstore/raw/{data_type}/dt={target_date}/app_id={app_id}/'
         
@@ -368,6 +543,18 @@ class UnifiedETL:
         for obj in response.get('Contents', []):
             if not obj['Key'].endswith('.csv'):
                 continue
+            
+            filename = obj['Key'].split('/')[-1].lower()
+            
+            # Only use STANDARD files for complete data
+            # Skip DETAILED files (only have attributed data, missing ~85%)
+            if 'detailed' in filename:
+                continue
+            
+            # Skip performance files (different metrics)
+            if 'performance' in filename:
+                continue
+                
             try:
                 csv_response = self.s3.get_object(Bucket=self.bucket, Key=obj['Key'])
                 content = csv_response['Body'].read().decode('utf-8')
@@ -402,19 +589,35 @@ class UnifiedETL:
         return total_rows
     
     def _transform_dataframe(self, data_type: str, df: pd.DataFrame, app_id: str, target_date: str) -> Optional[pd.DataFrame]:
-        """Transform raw DataFrame to curated schema with proper deduplication
+        """Transform raw DataFrame to curated schema with proper filtering and deduplication
         
-        Key fix: Sets dt partition to actual metric_date (from data), not processingDate.
-        Adds processing_date column for audit trail.
+        Key fixes:
+        1. Downloads: Filter to 'First-time download' + 'Redownload' only (matches Apple Analytics)
+        2. Installs: Filter to 'Install' events only
+        3. Engagement: Separate by Event type (Impression, Page view, Tap)
+        4. Sets dt partition to actual metric_date (from data), not processingDate
+        5. Adds processing_date column for audit trail
         """
         try:
             # First, deduplicate raw data (Apple sometimes provides overlapping segments)
             df = df.drop_duplicates()
             
+            # Skip if no Date column
+            if 'Date' not in df.columns:
+                return None
+            
             # Convert metric_date once - this is the actual date of the metrics
             metric_dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
             
             if data_type == 'downloads':
+                # Filter to only First-time download + Redownload (Apple Analytics definition)
+                # Excludes: Auto-update, Manual update, Restore
+                if 'Download Type' in df.columns:
+                    df = df[df['Download Type'].isin(['First-time download', 'Redownload'])]
+                    if df.empty:
+                        return None
+                    metric_dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+                
                 curated = pd.DataFrame({
                     'metric_date': pd.to_datetime(df['Date']).dt.date,
                     'app_name': df['App Name'],
@@ -426,39 +629,45 @@ class UnifiedETL:
                     'device': df.get('Device', ''),
                     'platform_version': df.get('Platform Version', ''),
                     'app_id_part': int(app_id),
-                    'processing_date': target_date,  # When Apple made data available
-                    'dt': metric_dates  # Partition by actual metric date
+                    'processing_date': target_date,
+                    'dt': metric_dates
                 })
                 curated = curated[curated['total_downloads'] > 0]
-                # Aggregate by all dimensions, sum metrics
                 group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'download_type', 
                               'source_type', 'device', 'platform_version', 'app_id_part', 'processing_date', 'dt']
                 return curated.groupby(group_cols, as_index=False).agg({'total_downloads': 'sum'})
                 
             elif data_type == 'engagement':
+                # Engagement has multiple event types: Impression, Page view, Tap
+                # Keep all events but store the event type
                 curated = pd.DataFrame({
                     'metric_date': pd.to_datetime(df['Date']).dt.date,
                     'app_name': df['App Name'],
                     'app_id': pd.to_numeric(df['App Apple Identifier'], errors='coerce').fillna(0).astype('int64'),
                     'territory': df['Territory'],
-                    'impressions': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),
+                    'event_type': df.get('Event', 'Unknown'),
+                    'counts': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),
                     'source_type': df.get('Source Type', ''),
                     'device': df.get('Device', ''),
                     'app_id_part': int(app_id),
                     'processing_date': target_date,
                     'dt': metric_dates
                 })
-                curated = curated[curated['impressions'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'source_type', 'device', 'app_id_part', 'processing_date', 'dt']
-                return curated.groupby(group_cols, as_index=False).agg({'impressions': 'sum'})
+                curated = curated[curated['counts'] > 0]
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'event_type', 'source_type', 'device', 'app_id_part', 'processing_date', 'dt']
+                return curated.groupby(group_cols, as_index=False).agg({'counts': 'sum'})
                 
             elif data_type == 'sessions':
+                # Sessions use 'Sessions' column, not 'Counts'
+                sessions_col = 'Sessions' if 'Sessions' in df.columns else 'Counts'
                 curated = pd.DataFrame({
                     'metric_date': pd.to_datetime(df['Date']).dt.date,
                     'app_name': df['App Name'],
                     'app_id': pd.to_numeric(df['App Apple Identifier'], errors='coerce').fillna(0).astype('int64'),
                     'territory': df['Territory'],
-                    'sessions': pd.to_numeric(df.get('Sessions', df.get('Counts', 0)), errors='coerce').fillna(0).astype('int64'),
+                    'sessions': pd.to_numeric(df[sessions_col], errors='coerce').fillna(0).astype('int64'),
+                    'total_duration': pd.to_numeric(df.get('Total Session Duration', 0), errors='coerce').fillna(0).astype('int64'),
+                    'unique_devices': pd.to_numeric(df.get('Unique Devices', 0), errors='coerce').fillna(0).astype('int64'),
                     'device': df.get('Device', ''),
                     'app_id_part': int(app_id),
                     'processing_date': target_date,
@@ -466,24 +675,39 @@ class UnifiedETL:
                 })
                 curated = curated[curated['sessions'] > 0]
                 group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'device', 'app_id_part', 'processing_date', 'dt']
-                return curated.groupby(group_cols, as_index=False).agg({'sessions': 'sum'})
+                return curated.groupby(group_cols, as_index=False).agg({
+                    'sessions': 'sum', 
+                    'total_duration': 'sum',
+                    'unique_devices': 'sum'
+                })
                 
             elif data_type == 'installs':
+                # Filter to 'Install' events only (exclude 'Delete')
+                if 'Event' in df.columns:
+                    df = df[df['Event'] == 'Install']
+                    if df.empty:
+                        return None
+                    metric_dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+                
                 curated = pd.DataFrame({
                     'metric_date': pd.to_datetime(df['Date']).dt.date,
                     'app_name': df['App Name'],
                     'app_id': pd.to_numeric(df['App Apple Identifier'], errors='coerce').fillna(0).astype('int64'),
                     'territory': df['Territory'],
-                    'counts': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),
-                    'event': df.get('Event', ''),
+                    'installs': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),
+                    'unique_devices': pd.to_numeric(df.get('Unique Devices', 0), errors='coerce').fillna(0).astype('int64'),
+                    'download_type': df.get('Download Type', ''),
                     'device': df.get('Device', ''),
                     'app_id_part': int(app_id),
                     'processing_date': target_date,
                     'dt': metric_dates
                 })
-                curated = curated[curated['counts'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'event', 'device', 'app_id_part', 'processing_date', 'dt']
-                return curated.groupby(group_cols, as_index=False).agg({'counts': 'sum'})
+                curated = curated[curated['installs'] > 0]
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'download_type', 'device', 'app_id_part', 'processing_date', 'dt']
+                return curated.groupby(group_cols, as_index=False).agg({
+                    'installs': 'sum',
+                    'unique_devices': 'sum'
+                })
                 
             elif data_type == 'purchases':
                 curated = pd.DataFrame({
@@ -493,14 +717,21 @@ class UnifiedETL:
                     'territory': df['Territory'],
                     'purchases': pd.to_numeric(df.get('Purchases', df.get('Counts', 0)), errors='coerce').fillna(0).astype('int64'),
                     'proceeds_usd': pd.to_numeric(df.get('Proceeds in USD', 0), errors='coerce').fillna(0.0),
+                    'paying_users': pd.to_numeric(df.get('Paying Users', 0), errors='coerce').fillna(0).astype('int64'),
                     'device': df.get('Device', ''),
                     'app_id_part': int(app_id),
                     'processing_date': target_date,
                     'dt': metric_dates
                 })
-                curated = curated[curated['purchases'] > 0]
+                # Include refunds (negative purchases) to match Apple Analytics
+                # Filter: purchases != 0 (not > 0) to include refunds
+                curated = curated[curated['purchases'] != 0]
                 group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'device', 'app_id_part', 'processing_date', 'dt']
-                return curated.groupby(group_cols, as_index=False).agg({'purchases': 'sum', 'proceeds_usd': 'sum'})
+                return curated.groupby(group_cols, as_index=False).agg({
+                    'purchases': 'sum', 
+                    'proceeds_usd': 'sum',
+                    'paying_users': 'sum'
+                })
             
             return None
         except Exception as e:
@@ -572,7 +803,12 @@ class UnifiedETL:
             
             # EXTRACT
             print("\n🔄 PHASE 1: EXTRACT")
-            for aid in app_ids:
+            for idx, aid in enumerate(app_ids):
+                # Add delay between apps to avoid rate limiting (except for first app)
+                if idx > 0:
+                    logger.info(f"⏱️  Waiting 10 seconds before processing next app...")
+                    time.sleep(10)
+                
                 result = self.extract_app_data(aid, date_str)
                 self.results['apps_processed'] += 1
                 if result['success']:
