@@ -1,7 +1,20 @@
 # Secrets and credentials
 .env
+.env.*
+!.env.template
 *.p8
 AuthKey_*.p8
+*.pem
+*.key
+*.crt
+*.cert
+*_webhook
+.slack_webhook
+secrets/
+credentials/
+*secret*
+*password*
+*token*
 
 # Python
 __pycache__/

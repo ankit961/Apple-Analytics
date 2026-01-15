@@ -1,10 +1,11 @@
 # 🍎 Apple Analytics ETL Pipeline
 
 > **Status**: ✅ Production Ready  
-> **Last Updated**: December 1, 2025  
-> **Apps**: 92 configured | 74 with active data
+> **Last Updated**: January 16, 2026  
+> **Apps**: 92 configured | 75 with active data  
+> **Monitoring**: ✅ Automated Slack reports enabled
 
-Automated ETL pipeline for extracting Apple App Store Connect Analytics data and loading it into AWS Athena.
+Automated ETL pipeline for extracting Apple App Store Connect Analytics data and loading it into AWS Athena with comprehensive monitoring and alerting.
 
 ---
 
@@ -23,7 +24,16 @@ python3 unified_etl.py
 
 ---
 
-## 📊 Current Status (December 1, 2025)
+## 📊 Current Status (January 16, 2026)
+
+| Metric | Value | Status |
+|--------|-------|--------|
+| **Success Rate** | 81.5% (75/92 apps) | ✅ Healthy |
+| **Registry Trust Period** | 180 days (6 months) | ✅ Extended |
+| **Monitoring** | Automated Slack reports | ✅ Active |
+| **Cron Schedule** | Daily at 09:30 UTC | ✅ Running |
+
+### Athena Tables
 
 | Athena Table | Rows | Apps | Status |
 |--------------|------|------|--------|
@@ -33,6 +43,12 @@ python3 unified_etl.py
 | `curated_installs` | 450,691 | 57 | ✅ 0 duplicates |
 | `curated_purchases` | 437,988 | 65 | ✅ 0 duplicates |
 
+### Recent Improvements (Jan 16, 2026)
+- ✅ **Extended registry trust period** from 60 to 180 days
+- ✅ **Automated Slack monitoring** with daily reports
+- ✅ **Enhanced logging** with pipe-delimited structured format
+- ✅ **Fixed 403 errors** by avoiding unnecessary API verification
+
 ---
 
 ## 📁 Project Structure
@@ -41,7 +57,8 @@ python3 unified_etl.py
 Apple-Analytics/
 ├── unified_etl.py               # 🔑 Daily ETL (ONGOING requests, daily data)
 ├── unified_onetime_etl.py       # 📅 Backfill ETL (ONE_TIME_SNAPSHOT requests)
-├── daily_cron.sh                # Cron wrapper for daily automation (6 AM)
+├── monitor_data_freshness.py   # 📊 Data freshness monitoring & Slack alerts
+├── daily_cron.sh                # Cron wrapper for daily automation (09:30 UTC)
 ├── startup_verification.sh      # Health check script
 ├── .env                         # Configuration (not in git)
 ├── .env.template                # Config template
@@ -66,6 +83,14 @@ Apple-Analytics/
 ├── config/
 │   └── etl_config.json            # Configuration
 │
+├── docs/                          # 📚 Comprehensive documentation
+│   ├── INDEX.md                   # Navigation guide
+│   ├── DEPLOYMENT_COMPLETE_JAN16.md           # Deployment summary
+│   ├── DATA_FRESHNESS_MONITORING_GUIDE.md     # Monitoring guide
+│   ├── SLACK_INTEGRATION_COMPLETE.md          # Slack setup
+│   ├── MONITORING_COMPLETE_SUMMARY.md         # Monitoring overview
+│   └── ... (11 total documentation files)
+│
 ├── logs/                          # ETL execution logs
 └── archive/                       # Legacy/archived files
 ```
@@ -74,11 +99,31 @@ Apple-Analytics/
 
 ## 🔧 Usage
 
+### 📊 Daily Monitoring (Automated)
+Pipeline automatically sends **Slack reports** at **09:35 UTC daily** after ETL completes.
+
+```bash
+# Manual data freshness check
+python3 monitor_data_freshness.py
+
+# Send Slack report manually
+python3 monitor_data_freshness.py --slack
+
+# Check specific date
+python3 monitor_data_freshness.py --date 2026-01-15
+
+# 7-day trend analysis
+python3 monitor_data_freshness.py --days 7
+```
+
+See [DATA_FRESHNESS_MONITORING_GUIDE.md](DATA_FRESHNESS_MONITORING_GUIDE.md) for complete monitoring documentation.
+
 ### Daily Automated Run (ONGOING Requests)
-Pipeline runs automatically at **6 AM daily** via cron using `unified_etl.py`.
+Pipeline runs automatically at **09:30 UTC daily** via cron using `unified_etl.py`.
 - Creates one ONGOING request per app (reused forever)
 - Extracts yesterday's data only
 - No 409 conflicts via S3 registry
+- **180-day registry trust period** (extended from 60 days)
 
 ### Manual Commands - Daily ETL (ONGOING)
 
@@ -127,11 +172,17 @@ python3 unified_onetime_etl.py --start-date 2025-11-01 --end-date 2025-11-05 --d
 # Check daily ETL logs
 tail -f logs/unified_etl_$(date +%Y%m%d).log
 
+# Check monitoring logs
+tail -f logs/monitor_$(date +%Y%m%d).log
+
 # Check backfill ETL logs
 tail -f logs/unified_onetime_etl_$(date +%Y%m%d).log
 
 # Verify cron is set up
-crontab -l | grep "unified_etl"
+crontab -l | grep "unified_etl\|monitor_data_freshness"
+
+# View latest data freshness report
+cat logs/data_freshness_$(date -v-1d +%Y-%m-%d).json | jq
 ```
 
 ---
@@ -333,9 +384,80 @@ Row Count: ~12K | Status: ✅ 0 duplicates
 
 ---
 
+## 📊 Monitoring & Alerting
+
+### Automated Slack Reports
+
+Daily reports are automatically sent to Slack at **09:35 UTC** (5 minutes after ETL completes).
+
+**Report includes:**
+- ✅ Overall success rate and status (HEALTHY/DEGRADED/CRITICAL)
+- 📊 Data type coverage breakdown (downloads, engagement, sessions, etc.)
+- 📖 Registry health metrics (average age, oldest registry)
+- ⚠️ List of apps with missing data
+- 📈 Trends and anomalies
+
+**Example Slack Message:**
+```
+✅ Apple Analytics ETL Report - 2026-01-16
+
+Status: HEALTHY
+Success Rate: 75/92 apps (81.5%)
+
+📊 Data Type Coverage:
+✅ downloads      75/92 (81.5%)
+✅ engagement     80/92 (87.0%)
+✅ sessions       78/92 (84.8%)
+✅ installs       82/92 (89.1%)
+⚠️  purchases     65/92 (70.7%)
+
+✅ Registry Health:
+• Average age: 48.3 days
+• Oldest: 50 days
+• Registries: 75/92
+```
+
+### Data Freshness Validation
+
+The monitoring system validates:
+1. **RAW data files** - CSV files in S3 by processing_date
+2. **CURATED data files** - Parquet files in S3 by metric_date  
+3. **Registry health** - Age and last_verified timestamps
+4. **Historical trends** - Success rate over time
+
+See [DATA_FRESHNESS_MONITORING_GUIDE.md](DATA_FRESHNESS_MONITORING_GUIDE.md) for complete details.
+
+### Key Performance Indicators
+
+| KPI | Target | Alert Threshold |
+|-----|--------|----------------|
+| Success Rate | ≥ 80% | < 70% |
+| downloads/engagement/sessions | ≥ 90% | < 60% |
+| installs | ≥ 85% | < 60% |
+| purchases | ≥ 70% | < 50% |
+| Average Registry Age | 30-90 days | > 120 days |
+
+---
+
 ## 📖 Full Documentation
 
-For comprehensive documentation including:
+### Quick Start Guides
+- **[INDEX.md](INDEX.md)** - Complete navigation guide
+- **[MONITORING_COMPLETE_SUMMARY.md](MONITORING_COMPLETE_SUMMARY.md)** - Monitoring overview
+- **[DATA_FRESHNESS_MONITORING_GUIDE.md](DATA_FRESHNESS_MONITORING_GUIDE.md)** - Complete monitoring usage
+
+### Deployment & Analysis
+- **[DEPLOYMENT_COMPLETE_JAN16.md](DEPLOYMENT_COMPLETE_JAN16.md)** - Latest deployment summary
+- **[FINAL_ROOT_CAUSE_CONFIRMED.md](FINAL_ROOT_CAUSE_CONFIRMED.md)** - Root cause analysis
+- **[PRODUCTION_ANALYSIS_JAN15.md](PRODUCTION_ANALYSIS_JAN15.md)** - Performance analysis
+
+### Slack Integration
+- **[SLACK_INTEGRATION_COMPLETE.md](SLACK_INTEGRATION_COMPLETE.md)** - Slack setup guide
+- **[SLACK_MESSAGE_PREVIEW.md](SLACK_MESSAGE_PREVIEW.md)** - Example messages
+- **[SLACK_LOGGING_QUICK_REFERENCE.md](SLACK_LOGGING_QUICK_REFERENCE.md)** - Quick reference
+
+### Legacy Documentation
+For comprehensive pipeline documentation including:
 - Complete pipeline flow diagrams
 - Deduplication logic details  
 - Troubleshooting guide

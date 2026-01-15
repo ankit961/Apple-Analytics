@@ -224,10 +224,7 @@ class AppleAnalyticsRequestor:
     
     def _should_trust_registry(self, registry_data: Dict, max_age_days: int = 30) -> bool:
         """
-        Determine if we should trust the registry without verification
-        
-        ONGOING requests don't expire, so we can trust them if:
-        - Created within max_age_days (default 30)
+        Check if registry is recent enough to trust without verification
         - This avoids unnecessary API calls
         """
         created_at_str = registry_data.get("created_at")
@@ -248,6 +245,49 @@ class AppleAnalyticsRequestor:
         except Exception as e:
             logger.warning(f"⚠️ Error parsing registry age: {e}")
             return False
+    
+    def _calculate_registry_age_days(self, created_at_str: str) -> Optional[int]:
+        """Calculate registry age in days from created_at timestamp"""
+        if not created_at_str:
+            return None
+        
+        try:
+            created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+            age = datetime.now(timezone.utc) - created_at
+            return age.days
+        except Exception as e:
+            logger.warning(f"⚠️ Error calculating registry age: {e}")
+            return None
+    
+    def _update_registry_last_verified(self, app_id: str, request_id: str):
+        """Update last_verified timestamp in registry to track usage"""
+        try:
+            # Read existing registry
+            registry_data = self._load_request_registry(app_id, "ONGOING")
+            if registry_data and registry_data.get("request_id") == request_id:
+                # Update last_verified timestamp
+                registry_data["last_verified"] = datetime.now(timezone.utc).isoformat()
+                
+                # Save back to S3 using correct path
+                registry_key = self._registry_key_for_app(app_id, "ONGOING")
+                self.s3_client.put_object(
+                    Bucket=self.s3_bucket,
+                    Key=registry_key,
+                    Body=json.dumps(registry_data, indent=2),
+                    ContentType="application/json"
+                )
+                logger.debug(f"✅ Updated last_verified for {app_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update last_verified: {e}")
+    
+    def _delete_request_registry(self, app_id: str):
+        """Delete stale registry entry"""
+        try:
+            registry_key = self._registry_key_for_app(app_id, "ONGOING")
+            self.s3_client.delete_object(Bucket=self.s3_bucket, Key=registry_key)
+            logger.info(f"🗑️ Deleted stale registry for {app_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to delete registry: {e}")
     
     def _extract_request_id_from_analytics_json(self, app_id: str) -> Optional[str]:
         """Extract request ID from existing analytics.json files as fallback"""
@@ -305,26 +345,43 @@ class AppleAnalyticsRequestor:
         registry_data = self._load_request_registry(app_id, "ONGOING")
         if registry_data:
             existing_rid = registry_data.get("request_id")
+            created_at = registry_data.get("created_at", "")
             
-            # OPTIMIZATION: Trust registry without verification if recent
-            if self._should_trust_registry(registry_data, max_age_days=30):
-                logger.info("♻️ Trusting recent registry (skip verification): %s", existing_rid)
-                return existing_rid
+            # Calculate registry age
+            age_days = self._calculate_registry_age_days(created_at)
             
-            # Verify it's still valid (with proper 429 handling)
-            is_valid, reason = self._verify_request_exists(existing_rid, skip_on_rate_limit=True)
-            if is_valid:
-                logger.info("♻️ Reusing ONGOING request from registry: %s (%s)", existing_rid, reason)
+            # ENHANCED: Trust registry for 6 months (180 days) to avoid 403 errors
+            # We'll rely on data freshness monitoring instead of API verification
+            if age_days is not None and age_days <= 180:
+                logger.info("📖 TRUSTED REGISTRY | app_id=%s | request_id=%s | age=%d days | created=%s | status=REUSING | reason=within_6_month_trust_period", 
+                           app_id, existing_rid, age_days, created_at[:10])
+                
+                # Update last_verified timestamp in registry
+                self._update_registry_last_verified(app_id, existing_rid)
                 return existing_rid
+            elif age_days is not None and age_days > 180:
+                logger.warning("🗑️ Registry STALE | app_id=%s | request_id=%s | age=%d days (>180) | created=%s | action=DELETE_AND_RECREATE", 
+                              app_id, existing_rid, age_days, created_at[:10])
+                self._delete_request_registry(app_id)
             else:
-                if reason == 'rate_limited':
-                    # Rate limited, but we'll trust the registry anyway
-                    logger.warning("⚠️ Verification rate limited, trusting registry: %s", existing_rid)
+                logger.warning("⚠️ Registry age unknown, will verify")
+                # Verify it's still valid (with proper 429 handling)
+                is_valid, reason = self._verify_request_exists(existing_rid, skip_on_rate_limit=True)
+                if is_valid:
+                    logger.info("♻️ Reusing ONGOING request from registry: %s (%s)", existing_rid, reason)
+                    self._update_registry_last_verified(app_id, existing_rid)
                     return existing_rid
                 else:
-                    logger.info("⚠️ Registry ONGOING request %s is invalid (%s), will create new", existing_rid, reason)
+                    if reason == 'rate_limited':
+                        # Rate limited, but we'll trust the registry anyway
+                        logger.warning("⚠️ Verification rate limited, trusting registry: %s", existing_rid)
+                        self._update_registry_last_verified(app_id, existing_rid)
+                        return existing_rid
+                    else:
+                        logger.info("⚠️ Registry ONGOING request %s is invalid (%s), will create new", existing_rid, reason)
         
-        # 2) Check Apple API for existing ONGOING request (with retry on 429)
+        # 2) Try to find existing ONGOING request via API
+        # Note: This may return None due to 403 errors (API key permissions)
         existing_rid = self._find_existing_ongoing_request_with_retry(app_id)
         if existing_rid:
             # Save to registry for future use
@@ -332,6 +389,7 @@ class AppleAnalyticsRequestor:
             return existing_rid
         
         # 3) Create new ONGOING request (with retry on 429)
+        # This may also fail with 409 + 403 if request exists but we can't list it
         return self._create_ongoing_request_with_retry(app_id)
     
     def _find_existing_ongoing_request(self, app_id: str) -> Optional[str]:
@@ -444,8 +502,16 @@ class AppleAnalyticsRequestor:
                     if existing_rid:
                         self._save_request_registry(app_id, "ONGOING", existing_rid)
                         return existing_rid
+                    
+                    # FALLBACK: Try to extract from analytics.json (avoids 403)
+                    logger.warning("⚠️ Can't list existing request (likely 403), trying analytics.json fallback...")
+                    fallback_rid = self._extract_request_id_from_analytics_json(app_id)
+                    if fallback_rid:
+                        logger.info("✅ Found request ID from analytics.json: %s", fallback_rid)
+                        self._save_request_registry(app_id, "ONGOING", fallback_rid)
+                        return fallback_rid
                         
-                    logger.error("409 conflict but could not find existing ONGOING request")
+                    logger.error("❌ 409 conflict but could not find existing ONGOING request (tried API + analytics.json)")
                     return None
                     
                 elif response.status_code == 429:
