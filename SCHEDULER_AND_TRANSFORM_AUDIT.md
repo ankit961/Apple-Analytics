@@ -1,6 +1,6 @@
 # Apple Analytics ETL - Scheduler & Transform Audit
 **Date:** 2026-01-11  
-**Environment:** EC2 Production (`44.211.143.180`)
+**Environment:** EC2 Production (`<PRODUCTION_IP>`)
 
 ---
 
