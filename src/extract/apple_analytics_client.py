@@ -11,6 +11,8 @@ import os
 import json
 import time
 import logging
+import random
+import threading
 from datetime import datetime, timedelta, date, timezone
 from typing import Dict, List, Optional, Tuple
 import requests
@@ -45,6 +47,20 @@ class AppleAnalyticsRequestor:
         
         # Load credentials
         self.headers = self._load_credentials()
+        
+        # ✅ NEW: Global rate limiter (token bucket - 1 request/second)
+        self.rate_limit_tokens = 1.0
+        self.rate_limit_capacity = 1.0
+        self.rate_limit_refill_rate = 1.0  # 1 token per second
+        self.rate_limit_last_update = time.time()
+        self.rate_limit_lock = threading.Lock()
+        
+        # ✅ NEW: Circuit breaker for 429 bursts
+        self.circuit_breaker_429_count = 0
+        self.circuit_breaker_window_start = time.time()
+        self.circuit_breaker_threshold = 5  # Pause if 5 429s in 2 minutes
+        self.circuit_breaker_window = 120  # 2-minute window
+        self.circuit_breaker_open = False
     
     def _generate_jwt_token(self, issuer_id: str, key_id: str, p8_path: str) -> str:
         """Generate JWT token with proper UTC timezone"""
@@ -130,6 +146,76 @@ class AppleAnalyticsRequestor:
             logger.error(f"❌ JWT refresh failed: {e}")
             raise
     
+    def _acquire_rate_limit_token(self):
+        """
+        Token bucket rate limiter - 1 request per second
+        Blocks until a token is available
+        """
+        with self.rate_limit_lock:
+            now = time.time()
+            
+            # Refill tokens based on time elapsed
+            time_elapsed = now - self.rate_limit_last_update
+            self.rate_limit_tokens = min(
+                self.rate_limit_capacity,
+                self.rate_limit_tokens + time_elapsed * self.rate_limit_refill_rate
+            )
+            self.rate_limit_last_update = now
+            
+            # Wait if no tokens available
+            if self.rate_limit_tokens < 1.0:
+                wait_time = (1.0 - self.rate_limit_tokens) / self.rate_limit_refill_rate
+                logger.debug(f"⏱️ Rate limiter: waiting {wait_time:.2f}s for token")
+                time.sleep(wait_time)
+                self.rate_limit_tokens = 0.0
+                self.rate_limit_last_update = time.time()
+            else:
+                # Consume 1 token
+                self.rate_limit_tokens -= 1.0
+    
+    def _check_circuit_breaker(self):
+        """
+        Check if circuit breaker is open (too many 429s recently)
+        If open, wait for window to reset
+        """
+        now = time.time()
+        
+        # Reset window if expired
+        if now - self.circuit_breaker_window_start > self.circuit_breaker_window:
+            self.circuit_breaker_429_count = 0
+            self.circuit_breaker_window_start = now
+            self.circuit_breaker_open = False
+        
+        # If circuit is open, force wait
+        if self.circuit_breaker_open:
+            time_remaining = self.circuit_breaker_window - (now - self.circuit_breaker_window_start)
+            if time_remaining > 0:
+                logger.warning(f"🚨 Circuit breaker OPEN - pausing for {time_remaining:.1f}s to let API quota recover")
+                time.sleep(time_remaining)
+                # Reset after wait
+                self.circuit_breaker_429_count = 0
+                self.circuit_breaker_window_start = time.time()
+                self.circuit_breaker_open = False
+    
+    def _record_429_error(self):
+        """
+        Record a 429 error and check if circuit breaker threshold is reached
+        """
+        now = time.time()
+        
+        # Reset window if expired
+        if now - self.circuit_breaker_window_start > self.circuit_breaker_window:
+            self.circuit_breaker_429_count = 0
+            self.circuit_breaker_window_start = now
+        
+        # Increment counter
+        self.circuit_breaker_429_count += 1
+        
+        # Check threshold
+        if self.circuit_breaker_429_count >= self.circuit_breaker_threshold:
+            self.circuit_breaker_open = True
+            logger.error(f"🚨 Circuit breaker TRIGGERED - {self.circuit_breaker_429_count} rate limits in {self.circuit_breaker_window}s window")
+    
     def _asc_request(self, method: str, url: str, max_retries: int = 3, **kwargs):
         """
         Auto-refreshing requests wrapper for Apple API calls
@@ -144,13 +230,47 @@ class AppleAnalyticsRequestor:
         
         for attempt in range(max_retries):
             try:
+                # Check circuit breaker before making request
+                self._check_circuit_breaker()
+                
+                # Acquire rate limit token before making request
+                self._acquire_rate_limit_token()
+                
                 response = requests.request(method, url, headers=self.headers, **kwargs)
                 
                 # If we get 401, try to refresh token once and retry
                 if response.status_code == 401:
                     logger.warning("🔄 Got 401, refreshing token and retrying...")
                     self._refresh_headers()
+                    # Acquire another token for retry
+                    self._acquire_rate_limit_token()
                     response = requests.request(method, url, headers=self.headers, **kwargs)
+                
+                # Handle 429 rate limiting with Retry-After header
+                if response.status_code == 429:
+                    self._record_429_error()
+                    
+                    # Check Retry-After header
+                    retry_after = response.headers.get('Retry-After')
+                    if retry_after:
+                        try:
+                            wait_time = int(retry_after)
+                            logger.warning(f"🚨 Rate limited (429) - Retry-After: {wait_time}s (attempt {attempt+1}/{max_retries})")
+                        except ValueError:
+                            # If not an integer, might be HTTP date - use default backoff
+                            wait_time = (2 ** attempt) * 10  # 10, 20, 40 seconds
+                            logger.warning(f"🚨 Rate limited (429) - using exponential backoff: {wait_time}s (attempt {attempt+1}/{max_retries})")
+                    else:
+                        # No Retry-After header - use exponential backoff with jitter
+                        wait_time = (2 ** attempt) * 10 + random.uniform(0, 5)
+                        logger.warning(f"🚨 Rate limited (429) - no Retry-After header, using backoff: {wait_time:.1f}s (attempt {attempt+1}/{max_retries})")
+                    
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ Rate limited after {max_retries} retries")
+                        return response  # Return 429 response to let caller handle
                 
                 return response
                 
@@ -495,23 +615,35 @@ class AppleAnalyticsRequestor:
                     return rid
                     
                 elif response.status_code == 409:
-                    logger.info("♻️ ONGOING already exists (409). Looking up...")
+                    logger.info("♻️ ONGOING already exists (409). Using registry/fallback immediately...")
                     
-                    # Try to find it via API
-                    existing_rid = self._find_existing_ongoing_request_with_retry(app_id)
-                    if existing_rid:
-                        self._save_request_registry(app_id, "ONGOING", existing_rid)
-                        return existing_rid
+                    # DON'T retry API listing - it wastes quota and often returns 403
+                    # Go straight to registry and fallback options
                     
-                    # FALLBACK: Try to extract from analytics.json (avoids 403)
-                    logger.warning("⚠️ Can't list existing request (likely 403), trying analytics.json fallback...")
+                    # Option 1: Check registry (most reliable)
+                    registry_data = self._load_request_registry(app_id, "ONGOING")
+                    if registry_data:
+                        existing_rid = registry_data.get("request_id")
+                        if existing_rid:
+                            logger.info("✅ Using ONGOING from registry: %s", existing_rid)
+                            return existing_rid
+                    
+                    # Option 2: Try analytics.json fallback (avoids 403)
+                    logger.warning("⚠️ No registry found, trying analytics.json fallback...")
                     fallback_rid = self._extract_request_id_from_analytics_json(app_id)
                     if fallback_rid:
                         logger.info("✅ Found request ID from analytics.json: %s", fallback_rid)
                         self._save_request_registry(app_id, "ONGOING", fallback_rid)
                         return fallback_rid
+                    
+                    # Option 3: Last resort - try API list once (may return 403)
+                    logger.warning("⚠️ Trying API list as last resort...")
+                    existing_rid = self._find_existing_ongoing_request(app_id)
+                    if existing_rid:
+                        self._save_request_registry(app_id, "ONGOING", existing_rid)
+                        return existing_rid
                         
-                    logger.error("❌ 409 conflict but could not find existing ONGOING request (tried API + analytics.json)")
+                    logger.error("❌ 409 conflict but could not find existing ONGOING request (tried registry + analytics.json + API)")
                     return None
                     
                 elif response.status_code == 429:
@@ -545,22 +677,26 @@ class AppleAnalyticsRequestor:
         Returns:
             tuple[bool, str]: (is_valid, reason)
             - (True, 'valid') - Request exists and is valid
-            - (False, 'rate_limited') - Hit 429, can't verify but might be valid
+            - (True, 'permission_denied') - 403 error, trust registry instead
+            - (True, 'rate_limited') - Hit 429, can't verify but trust registry
             - (False, 'not_found') - Request doesn't exist (404)
             - (False, 'error') - Other error
         """
         try:
             url = f"{self.api_base}/analyticsReportRequests/{request_id}"
-            response = self._asc_request('GET', url, timeout=30)
+            # Only try once for verification (max_retries=1) - don't waste quota
+            response = self._asc_request('GET', url, max_retries=1, timeout=30)
             
             if response.status_code == 200:
                 return (True, 'valid')
+            elif response.status_code == 403:
+                # 403 = permission denied, but registry says it exists - trust registry
+                logger.warning("⚠️ 403 during verification - trusting registry (API permission issue)")
+                return (True, 'permission_denied')
             elif response.status_code == 429:
                 # Rate limited - we can't verify, but don't assume invalid
-                if skip_on_rate_limit:
-                    logger.warning("⚠️ Rate limited during verification, assuming valid")
-                    return (True, 'rate_limited')  # Assume valid to avoid cascade
-                return (False, 'rate_limited')
+                logger.warning("⚠️ Rate limited during verification - trusting registry")
+                return (True, 'rate_limited')
             elif response.status_code == 404:
                 return (False, 'not_found')
             else:
@@ -899,7 +1035,7 @@ class AppleAnalyticsRequestor:
                 Bucket=self.s3_bucket,
                 Key=s3_key,
                 Body=json.dumps(state, indent=2),
-                ContentType='application/json'
+                ContentType="application/json"
             )
         except Exception as e:
             logger.warning("Failed to save request state: %s", e)
@@ -922,7 +1058,7 @@ class AppleAnalyticsRequestor:
                 Bucket=self.s3_bucket,
                 Key=s3_key,
                 Body=json.dumps(state, indent=2),
-                ContentType='application/json'
+                ContentType="application/json"
             )
             
         except Exception as e:

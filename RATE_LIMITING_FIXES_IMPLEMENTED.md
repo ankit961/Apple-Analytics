@@ -218,19 +218,19 @@ def _load_request_registry(...) -> Optional[Dict]:
 
 ```bash
 # From local machine
-scp -i data_analytics_etl.pem \
+scp -i <PEM_FILE> \
   Apple-Analytics/src/extract/apple_analytics_client.py \
-  ec2-user@44.211.143.180:/data/apple-analytics/src/extract/
+  ec2-user@<PRODUCTION_IP>:/data/apple-analytics/src/extract/
 
-scp -i data_analytics_etl.pem \
+scp -i <PEM_FILE> \
   Apple-Analytics/unified_etl.py \
-  ec2-user@44.211.143.180:/data/apple-analytics/
+  ec2-user@<PRODUCTION_IP>:/data/apple-analytics/
 ```
 
 ### 2. Verify Files on EC2
 
 ```bash
-ssh -i data_analytics_etl.pem ec2-user@44.211.143.180
+ssh -i <PEM_FILE> ec2-user@<PRODUCTION_IP>
 
 # Check the files
 grep -A 5 "_should_trust_registry" /data/apple-analytics/src/extract/apple_analytics_client.py

@@ -58,7 +58,7 @@ Runtime: ~20 minutes (acceptable with 10s delays)
 
 #### 2. Check Cron Log
 ```bash
-ssh -i data_analytics_etl.pem ec2-user@44.211.143.180
+ssh -i <PEM_FILE> ec2-user@<PRODUCTION_IP>
 tail -100 /data/apple-analytics/logs/cron.log
 ```
 
@@ -185,7 +185,7 @@ If tomorrow's run fails or has issues:
 
 ```bash
 # SSH to EC2
-ssh -i data_analytics_etl.pem ec2-user@44.211.143.180
+ssh -i <PEM_FILE> ec2-user@<PRODUCTION_IP>
 
 # Check what went wrong
 tail -200 /data/apple-analytics/logs/cron.log
