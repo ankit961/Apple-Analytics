@@ -640,25 +640,34 @@ class UnifiedETL:
             elif data_type == 'engagement':
                 # Engagement has multiple event types: Impression, Page view, Tap
                 # Keep all events but store the event type
+                # FIXED: Added impressions_unique column from 'Unique Counts'
+                # COMPATIBILITY: Added counts column for table compatibility
                 curated = pd.DataFrame({
                     'metric_date': pd.to_datetime(df['Date']).dt.date,
                     'app_name': df['App Name'],
                     'app_id': pd.to_numeric(df['App Apple Identifier'], errors='coerce').fillna(0).astype('int64'),
                     'territory': df['Territory'],
                     'event_type': df.get('Event', 'Unknown'),
-                    'counts': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),
+                    'impressions': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),
+                    'impressions_unique': pd.to_numeric(df['Unique Counts'] if 'Unique Counts' in df.columns else pd.Series([0] * len(df)), errors='coerce').fillna(0).astype('int64'),
+                    'counts': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),  # For table compatibility
                     'source_type': df.get('Source Type', ''),
                     'device': df.get('Device', ''),
-                    'app_id_part': int(app_id),
+                    'platform_version': df.get('Platform Version', ''),
                     'processing_date': target_date,
                     'dt': metric_dates
                 })
-                curated = curated[curated['counts'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'event_type', 'source_type', 'device', 'app_id_part', 'processing_date', 'dt']
-                return curated.groupby(group_cols, as_index=False).agg({'counts': 'sum'})
+                curated = curated[(curated['impressions'] > 0) | (curated['impressions_unique'] > 0)]
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'event_type', 'source_type', 'device', 'platform_version', 'processing_date', 'dt']
+                return curated.groupby(group_cols, as_index=False).agg({
+                    'impressions': 'sum',
+                    'impressions_unique': 'sum',
+                    'counts': 'sum'
+                })
                 
             elif data_type == 'sessions':
                 # Sessions use 'Sessions' column, not 'Counts'
+                # COMPATIBILITY: Changed total_duration to total_session_duration for table compatibility
                 sessions_col = 'Sessions' if 'Sessions' in df.columns else 'Counts'
                 curated = pd.DataFrame({
                     'metric_date': pd.to_datetime(df['Date']).dt.date,
@@ -666,23 +675,25 @@ class UnifiedETL:
                     'app_id': pd.to_numeric(df['App Apple Identifier'], errors='coerce').fillna(0).astype('int64'),
                     'territory': df['Territory'],
                     'sessions': pd.to_numeric(df[sessions_col], errors='coerce').fillna(0).astype('int64'),
-                    'total_duration': pd.to_numeric(df.get('Total Session Duration', 0), errors='coerce').fillna(0).astype('int64'),
+                    'total_session_duration': pd.to_numeric(df.get('Total Session Duration', 0), errors='coerce').fillna(0).astype('int64'),
                     'unique_devices': pd.to_numeric(df.get('Unique Devices', 0), errors='coerce').fillna(0).astype('int64'),
                     'device': df.get('Device', ''),
-                    'app_id_part': int(app_id),
+                    'platform_version': df.get('Platform Version', ''),
+                    'source_type': df.get('Source Type', ''),
                     'processing_date': target_date,
                     'dt': metric_dates
                 })
                 curated = curated[curated['sessions'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'device', 'app_id_part', 'processing_date', 'dt']
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'device', 'platform_version', 'source_type', 'processing_date', 'dt']
                 return curated.groupby(group_cols, as_index=False).agg({
                     'sessions': 'sum', 
-                    'total_duration': 'sum',
+                    'total_session_duration': 'sum',
                     'unique_devices': 'sum'
                 })
                 
             elif data_type == 'installs':
                 # Filter to 'Install' events only (exclude 'Delete')
+                # COMPATIBILITY: Changed installs to counts for table compatibility
                 if 'Event' in df.columns:
                     df = df[df['Event'] == 'Install']
                     if df.empty:
@@ -694,18 +705,19 @@ class UnifiedETL:
                     'app_name': df['App Name'],
                     'app_id': pd.to_numeric(df['App Apple Identifier'], errors='coerce').fillna(0).astype('int64'),
                     'territory': df['Territory'],
-                    'installs': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),
+                    'counts': pd.to_numeric(df['Counts'], errors='coerce').fillna(0).astype('int64'),
                     'unique_devices': pd.to_numeric(df.get('Unique Devices', 0), errors='coerce').fillna(0).astype('int64'),
                     'download_type': df.get('Download Type', ''),
                     'device': df.get('Device', ''),
-                    'app_id_part': int(app_id),
+                    'platform_version': df.get('Platform Version', ''),
+                    'source_type': df.get('Source Type', ''),
                     'processing_date': target_date,
                     'dt': metric_dates
                 })
-                curated = curated[curated['installs'] > 0]
-                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'download_type', 'device', 'app_id_part', 'processing_date', 'dt']
+                curated = curated[curated['counts'] > 0]
+                group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'download_type', 'device', 'platform_version', 'source_type', 'processing_date', 'dt']
                 return curated.groupby(group_cols, as_index=False).agg({
-                    'installs': 'sum',
+                    'counts': 'sum',
                     'unique_devices': 'sum'
                 })
                 
