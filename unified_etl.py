@@ -62,6 +62,97 @@ logger = logging.getLogger(__name__)
 from src.extract.apple_analytics_client import AppleAnalyticsRequestor
 
 
+# =============================================================================
+# ENGAGEMENT: ONE DAILY INSTANCE PER DATE
+# =============================================================================
+# Every run downloads all report instances Apple still retains (~35 days):
+#   * DAILY instances - each covers 3 dates and restates the previous 2 with
+#     slightly different counts each time. A large instance is split into several
+#     segment files, and an instance can also carry Apple's later corrections for
+#     many older dates (e.g. one published Aug 2026 re-sent Jan-Jul 2026);
+#   * WEEKLY instances - dated the week's Monday, carrying the whole week;
+#   * MONTHLY instances - dated the 1st, carrying the whole month.
+#   Roll-up corrections arrive the same way: one file of many Mondays (or 1sts).
+# Apple: the newest processing date supersedes older instances for the same Date;
+# never merge instances (developer.apple.com/documentation/analytics-reports/
+# data-completeness-corrections). Summing them inflated Mondays ~7x, the 1st
+# ~30x and ordinary days by up to ~70%.
+# A WEEKLY instance is published only after its week ends (observed Monday+11),
+# so a single-date file dated a Monday/1st and downloaded within this many days
+# of that date can only be a DAILY instance.
+ROLLUP_SAFE_DAYS = 6
+RAW_MEASURE_COLS = ('Counts', 'Unique Counts')
+
+
+def _row_keys(rows: pd.DataFrame) -> set:
+    dims = [c for c in rows.columns if c not in RAW_MEASURE_COLS]
+    return set(rows[dims].astype(str).itertuples(index=False, name=None))
+
+
+def select_latest_daily_instance(files: List[Dict], processing_date: str) -> Tuple[pd.DataFrame, Dict]:
+    """Keep, for every Date, only the rows of the newest DAILY instance covering it.
+
+    files: [{'df': raw Standard engagement DataFrame, 'meta': S3 object metadata,
+             'seen': optional date the file was downloaded (default processing_date)}]
+    Files saved with instance metadata ('granularity', 'processing-date',
+    'instance-id') are classified and grouped by it. Older files have none, so:
+      * a file whose dates are all Mondays (or all 1sts) is a WEEKLY/MONTHLY
+        roll-up - a daily instance covers consecutive days - except a single-date
+        file downloaded within ROLLUP_SAFE_DAYS of its date; any other file is DAILY;
+      * a DAILY file's processing date is its last Date, and the files sharing the
+        newest one are the segments of that instance - appended as long as their
+        rows for the date do not repeat a dimension key (another instance would).
+    """
+    daily = []
+    stats = {'daily_files': 0, 'rollup_files': 0}
+    for f in files:
+        df, meta = f['df'], f.get('meta') or {}
+        date_col = df['Date'].astype(str)
+        dates = sorted(date_col.unique())
+        if not dates:
+            continue
+        granularity = (meta.get('granularity') or '').upper()
+        if granularity:
+            is_daily = granularity == 'DAILY'
+            rank, instance = meta.get('processing-date') or dates[-1], meta.get('instance-id')
+        else:
+            days = pd.to_datetime(pd.Series(dates))
+            rollup_dated = bool((days.dt.weekday == 0).all() or (days.dt.day == 1).all())
+            seen = pd.Timestamp(f.get('seen') or processing_date)
+            is_daily = (not rollup_dated
+                        or (len(dates) == 1 and (seen - days.iloc[0]).days <= ROLLUP_SAFE_DAYS))
+            rank, instance = dates[-1], None
+        if not is_daily:
+            stats['rollup_files'] += 1
+            continue
+        stats['daily_files'] += 1
+        daily.append({'df': df, 'rows_by_date': date_col.groupby(date_col).indices, 'dates': set(dates),
+                      'rank': rank, 'instance': instance})
+
+    picked = []
+    for date in sorted(set().union(*(f['dates'] for f in daily)) if daily else ()):
+        candidates = sorted((f for f in daily if date in f['dates']), key=lambda f: f['rank'], reverse=True)
+        newest = [f for f in candidates
+                  if f['rank'] == candidates[0]['rank'] and f['instance'] == candidates[0]['instance']]
+        if len(newest) == 1:
+            picked.append(newest[0]['df'].iloc[newest[0]['rows_by_date'][date]])
+            continue
+        parts, keys = [], set()
+        for f in newest:
+            rows = f['df'].iloc[f['rows_by_date'][date]]
+            row_keys = _row_keys(rows)
+            if keys & row_keys:
+                continue    # same processing date but another instance: keep the first
+            parts.append(rows)
+            keys |= row_keys
+        picked.append(pd.concat(parts, ignore_index=True))
+
+    stats['dates'] = len(picked)
+    if not picked:
+        return pd.DataFrame(), stats
+    return pd.concat(picked, ignore_index=True), stats
+
+
 class UnifiedETL:
     """
     Unified ETL Pipeline for Apple Analytics
@@ -162,7 +253,8 @@ class UnifiedETL:
                     for instance in instances:
                         instance_id = instance['id']
                         files, rows = self._download_instance_data(
-                            instance_id, app_id, report_name, target_date
+                            instance_id, app_id, report_name, target_date,
+                            instance.get('attributes', {})
                         )
                         if files > 0:
                             result['files'] += files
@@ -194,8 +286,9 @@ class UnifiedETL:
         
         return result
     
-    def _download_instance_data(self, instance_id: str, app_id: str, 
-                                report_name: str, target_date: str) -> Tuple[int, int]:
+    def _download_instance_data(self, instance_id: str, app_id: str,
+                                report_name: str, target_date: str,
+                                instance_attrs: Optional[Dict] = None) -> Tuple[int, int]:
         """Download data from an instance - proven logic from daily_etl.py"""
         files_downloaded = 0
         total_rows = 0
@@ -226,8 +319,9 @@ class UnifiedETL:
                         download_url = seg_detail_attrs.get('url') or seg_detail_attrs.get('downloadUrl')
                 
                 if download_url:
-                    rows = self._download_and_save(download_url, app_id, report_name, 
-                                                   instance_id, segment_id, target_date)
+                    rows = self._download_and_save(download_url, app_id, report_name,
+                                                   instance_id, segment_id, target_date,
+                                                   instance_attrs)
                     if rows > 0:
                         files_downloaded += 1
                         total_rows += rows
@@ -238,7 +332,8 @@ class UnifiedETL:
         return files_downloaded, total_rows
     
     def _download_and_save(self, download_url: str, app_id: str, report_name: str,
-                          instance_id: str, segment_id: str, target_date: str) -> int:
+                          instance_id: str, segment_id: str, target_date: str,
+                          instance_attrs: Optional[Dict] = None) -> int:
         """Download file from URL and save to S3"""
         try:
             response = http_requests.get(download_url, timeout=120)
@@ -275,12 +370,23 @@ class UnifiedETL:
             # S3 key
             s3_key = f"appstore/raw/{report_type}/dt={target_date}/app_id={app_id}/{clean_name}_{segment_id}.csv"
             
+            # Engagement curation needs each file's instance granularity and
+            # processing date to pick the newest DAILY instance per date.
+            extra = {}
+            if report_type == 'engagement' and instance_attrs:
+                extra['Metadata'] = {
+                    'granularity': str(instance_attrs.get('granularity') or ''),
+                    'processing-date': str(instance_attrs.get('processingDate') or ''),
+                    'instance-id': instance_id,
+                }
+
             # Upload to S3
             self.s3.put_object(
                 Bucket=self.bucket,
                 Key=s3_key,
                 Body=text_content.encode('utf-8'),
-                ContentType='text/csv'
+                ContentType='text/csv',
+                **extra
             )
             
             logger.info(f"      ✅ {report_type}/{clean_name}: {row_count} rows")
@@ -475,12 +581,12 @@ class UnifiedETL:
             # EXTRACT REVIEWS
     # =========================================================================
     
-    def transform_to_parquet(self, target_date: str) -> Dict:
+    def transform_to_parquet(self, target_date: str, data_types: Optional[List[str]] = None) -> Dict:
         """Transform raw CSV to curated Parquet for a date"""
         result = {'files': 0, 'rows': 0, 'by_type': {}}
-        
-        data_types = ['downloads', 'engagement', 'sessions', 'installs', 'purchases']
-        
+
+        data_types = data_types or ['downloads', 'engagement', 'sessions', 'installs', 'purchases']
+
         for data_type in data_types:
             type_result = self._curate_data_type(data_type, target_date)
             result['by_type'][data_type] = type_result
@@ -517,10 +623,8 @@ class UnifiedETL:
             app_id = app_path.split('app_id=')[1].rstrip('/')
             
             try:
-                # For engagement, use lookback across multiple processing dates
-                # because Apple delivers additional segment files in earlier processing dates
-                if False and data_type == "engagement":
-                    curated_rows = self._curate_engagement_with_lookback(app_id, target_date)
+                if data_type == 'engagement':
+                    curated_rows = self._curate_engagement_latest_daily(app_id, target_date)
                 else:
                     curated_rows = self._curate_app_data_from_processing_date(data_type, app_id, target_date)
                 if curated_rows > 0:
@@ -533,78 +637,41 @@ class UnifiedETL:
             logger.info(f"   📊 {data_type}: {result['files']} apps, {result['rows']:,} rows")
         return result
     
-    def _curate_engagement_with_lookback(self, app_id: str, processing_date: str) -> int:
-        """Curate engagement data by combining files across multiple processing dates.
+    def _curate_engagement_latest_daily(self, app_id: str, processing_date: str) -> int:
+        """Curate engagement from one processing-date folder, taking every metric
+        date from the newest DAILY instance only (see select_latest_daily_instance).
+        Dates covered only by WEEKLY/MONTHLY roll-ups are not written."""
+        prefix = f'appstore/raw/engagement/dt={processing_date}/app_id={app_id}/'
+        files = []
+        for page in self.s3.get_paginator('list_objects_v2').paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                filename = obj['Key'].split('/')[-1].lower()
+                # Only use STANDARD files (Detailed files are privacy-thresholded)
+                if not obj['Key'].endswith('.csv') or 'detailed' in filename or 'performance' in filename:
+                    continue
+                try:
+                    resp = self.s3.get_object(Bucket=self.bucket, Key=obj['Key'])
+                    df = pd.read_csv(io.BytesIO(resp['Body'].read()), sep='\t', low_memory=False)
+                except Exception as e:
+                    logger.debug(f"Error reading {obj['Key']}: {e}")
+                    continue
+                if df.empty or 'Date' not in df.columns:
+                    continue
+                files.append({'df': df, 'meta': resp.get('Metadata', {})})
 
-        Apple delivers engagement data incrementally - each processing date folder
-        contains segment files, but not all segments appear in every processing date.
-        To get the complete picture, we need to read standard files from multiple
-        processing dates and combine them.
-
-        Strategy:
-        1. Read standard files from current and previous LOOKBACK_DAYS processing dates
-        2. Combine all files, drop exact row duplicates
-        3. Run through _transform_dataframe (which does SUM aggregation)
-        4. Write separate curated files per metric_date
-        """
-        base_date = datetime.strptime(processing_date, '%Y-%m-%d')
-        all_dfs = []
-        files_read = 0
-
-        # Read from current and previous processing dates
-        for day_offset in range(-self.LOOKBACK_DAYS, 1):
-            pd_str = (base_date + timedelta(days=day_offset)).strftime('%Y-%m-%d')
-            prefix = f'appstore/raw/engagement/dt={pd_str}/app_id={app_id}/'
-
-            try:
-                response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
-
-                for obj in response.get('Contents', []):
-                    if not obj['Key'].endswith('.csv'):
-                        continue
-
-                    filename = obj['Key'].split('/')[-1].lower()
-
-                    # Only use STANDARD files (not detailed or performance)
-                    if 'detailed' in filename or 'performance' in filename:
-                        continue
-
-                    try:
-                        csv_response = self.s3.get_object(Bucket=self.bucket, Key=obj['Key'])
-                        content = csv_response['Body'].read().decode('utf-8')
-                        df = pd.read_csv(io.StringIO(content), sep='\t', low_memory=False)
-                        if df.empty or 'Date' not in df.columns:
-                            continue
-                        # Filter to rolling 3-day segments only (matches ASC dashboard;
-                        # 1-day singletons and long-rollups inflate totals when summed)
-                        if df['Date'].nunique() != 3:
-                            continue
-                        all_dfs.append(df)
-                        files_read += 1
-                    except Exception as e:
-                        logger.debug(f"Error reading {obj['Key']}: {e}")
-                        continue
-
-            except Exception as e:
-                logger.debug(f"Error listing dt={pd_str}: {e}")
-                continue
-
-        if not all_dfs:
+        if not files:
             return 0
 
-        # Combine ALL files and remove exact row duplicates
-        combined = pd.concat(all_dfs, ignore_index=True)
-        combined = combined.drop_duplicates()
+        selected, stats = select_latest_daily_instance(files, processing_date)
+        logger.debug(f"      engagement/{app_id}: {stats['daily_files']} daily files, "
+                     f"{stats['rollup_files']} roll-ups skipped, {stats['dates']} dates")
+        if selected.empty:
+            return 0
 
-        logger.debug(f"      engagement/{app_id}: {files_read} files from {self.LOOKBACK_DAYS+1} processing dates, {len(combined):,} rows after dedup")
-
-        # Transform (this does SUM aggregation by dimension)
-        curated = self._transform_dataframe('engagement', combined, app_id, processing_date)
-
+        curated = self._transform_dataframe('engagement', selected, app_id, processing_date)
         if curated is None or curated.empty:
             return 0
 
-        # Write separate files for each metric_date
         total_rows = 0
         for metric_date_val, date_group in curated.groupby('dt'):
             output_key = f'appstore/curated/engagement/dt={metric_date_val}/app_id={app_id}/data.parquet'
@@ -917,12 +984,10 @@ class UnifiedETL:
                 return result
                 
             elif data_type == "engagement":
-                # Use STANDARD files only (ETL already filters out detailed files).
-                # Dedup strategy: plain drop_duplicates() removes exact row duplicates
-                # from overlapping segment files, but keeps rows where same dimensions
-                # have different Counts (these are different measurement windows that
-                # Apple sums together). Validated: 48,059 vs Apple 49,615 = 3.1% match.
-            
+                # Input is already one DAILY instance per date (select_latest_daily_instance),
+                # so summing by dimension cannot double count. `impressions` holds Apple's
+                # Counts for every Event (Impression / Page view / Tap).
+
                 curated = pd.DataFrame({
                     'metric_date': pd.to_datetime(df['Date']).dt.date,
                     'app_name': df['App Name'],
@@ -941,11 +1006,12 @@ class UnifiedETL:
                 })
                 curated = curated[(curated['impressions'] > 0) | (curated['impressions_unique'] > 0)]
             
-                # Aggregate by dimension columns, using SUM
+                # Aggregate by dimension columns, using SUM. dropna=False keeps rows with a
+                # blank dimension (e.g. unknown Territory) that App Store Connect counts.
                 group_cols = ['metric_date', 'app_name', 'app_id', 'territory', 'event_type',
                               'page_type', 'source_type', 'device', 'platform_version',
                               'app_id_part', 'processing_date', 'dt']
-                result = curated.groupby(group_cols, as_index=False).agg({
+                result = curated.groupby(group_cols, as_index=False, dropna=False).agg({
                     'impressions': 'sum',
                     'impressions_unique': 'sum'
                 })
@@ -1202,6 +1268,9 @@ def main():
     parser.add_argument('--days', type=int, default=30, help='Days to backfill')
     parser.add_argument('--transform-only', action='store_true', help='Only run transform phase (skip extract)')
     parser.add_argument('--load-only', action='store_true', help='Only run load phase (refresh Athena partitions)')
+    parser.add_argument('--data-type', type=str, action='append',
+                        choices=['downloads', 'engagement', 'sessions', 'installs', 'purchases'],
+                        help='With --transform-only: curate only this data type (repeatable)')
     
     args = parser.parse_args()
     
@@ -1211,7 +1280,7 @@ def main():
 # Transform-only mode
         target_date = args.date or (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
         print(f"🔄 TRANSFORM-ONLY MODE for {target_date}")
-        result = etl.transform_to_parquet(target_date)
+        result = etl.transform_to_parquet(target_date, args.data_type)
         print(f"✅ Curated {result['files']} files with {result['rows']:,} rows")
         print("\n🔄 Refreshing Athena partitions...")
         etl.refresh_athena_partitions()
