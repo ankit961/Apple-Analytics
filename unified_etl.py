@@ -81,6 +81,9 @@ from src.extract.apple_analytics_client import AppleAnalyticsRequestor
 # so a single-date file dated a Monday/1st and downloaded within this many days
 # of that date can only be a DAILY instance.
 ROLLUP_SAFE_DAYS = 6
+# A date's last regular restatement is the DAILY instance whose span starts on it:
+# processing date = date + 3 (legacy files, no metadata: last Date = date + 2).
+FINAL_LAG_DAYS = {'meta': 3, 'legacy': 2}
 RAW_MEASURE_COLS = ('Counts', 'Unique Counts')
 
 
@@ -89,7 +92,8 @@ def _row_keys(rows: pd.DataFrame) -> set:
     return set(rows[dims].astype(str).itertuples(index=False, name=None))
 
 
-def select_latest_daily_instance(files: List[Dict], processing_date: str) -> Tuple[pd.DataFrame, Dict]:
+def select_latest_daily_instance(files: List[Dict], processing_date: str,
+                                 only_final: bool = False) -> Tuple[pd.DataFrame, Dict]:
     """Keep, for every Date, only the rows of the newest DAILY instance covering it.
 
     files: [{'df': raw Standard engagement DataFrame, 'meta': S3 object metadata,
@@ -102,7 +106,16 @@ def select_latest_daily_instance(files: List[Dict], processing_date: str) -> Tup
       * a DAILY file's processing date is its last Date, and the files sharing the
         newest one are the segments of that instance - appended as long as their
         rows for the date do not repeat a dimension key (another instance would).
+    An instance with fewer files than its recorded 'segment-count' is incomplete (a
+    download failed) and is ignored. With only_final, a date is skipped when the files
+    reach past its final restatement but that instance is missing - the stored value
+    is then kept rather than replaced by an older copy.
     """
+    seen_segments = {}
+    for f in files:
+        iid = (f.get('meta') or {}).get('instance-id')
+        if iid:
+            seen_segments[iid] = seen_segments.get(iid, 0) + 1
     daily = []
     stats = {'daily_files': 0, 'rollup_files': 0}
     for f in files:
@@ -113,8 +126,13 @@ def select_latest_daily_instance(files: List[Dict], processing_date: str) -> Tup
             continue
         granularity = (meta.get('granularity') or '').upper()
         if granularity:
+            expected = meta.get('segment-count')
+            if expected and seen_segments.get(meta.get('instance-id'), 0) < int(expected):
+                stats['partial_files'] = stats.get('partial_files', 0) + 1
+                continue
             is_daily = granularity == 'DAILY'
             rank, instance = meta.get('processing-date') or dates[-1], meta.get('instance-id')
+            kind = 'meta'
         else:
             days = pd.to_datetime(pd.Series(dates))
             rollup_dated = bool((days.dt.weekday == 0).all() or (days.dt.day == 1).all())
@@ -122,16 +140,24 @@ def select_latest_daily_instance(files: List[Dict], processing_date: str) -> Tup
             is_daily = (not rollup_dated
                         or (len(dates) == 1 and (seen - days.iloc[0]).days <= ROLLUP_SAFE_DAYS))
             rank, instance = dates[-1], None
+            kind = 'legacy'
         if not is_daily:
             stats['rollup_files'] += 1
             continue
         stats['daily_files'] += 1
         daily.append({'df': df, 'rows_by_date': date_col.groupby(date_col).indices, 'dates': set(dates),
-                      'rank': rank, 'instance': instance})
+                      'rank': rank, 'instance': instance, 'lag': FINAL_LAG_DAYS[kind]})
 
     picked = []
+    newest_available = max((f['rank'] for f in daily), default='')
+    stats['skipped_not_final'] = 0
     for date in sorted(set().union(*(f['dates'] for f in daily)) if daily else ()):
         candidates = sorted((f for f in daily if date in f['dates']), key=lambda f: f['rank'], reverse=True)
+        if only_final:
+            final = (pd.Timestamp(date) + pd.Timedelta(days=candidates[0]['lag'])).strftime('%Y-%m-%d')
+            if candidates[0]['rank'] < final <= newest_available:
+                stats['skipped_not_final'] += 1
+                continue
         newest = [f for f in candidates
                   if f['rank'] == candidates[0]['rank'] and f['instance'] == candidates[0]['instance']]
         if len(newest) == 1:
@@ -302,6 +328,8 @@ class UnifiedETL:
                 return 0, 0
             
             segments = seg_response.json().get('data', [])
+            # Curation checks that every segment of an instance arrived.
+            instance_attrs = dict(instance_attrs or {}, segmentCount=len(segments))
             
             for segment in segments:
                 segment_id = segment['id']
@@ -378,6 +406,7 @@ class UnifiedETL:
                     'granularity': str(instance_attrs.get('granularity') or ''),
                     'processing-date': str(instance_attrs.get('processingDate') or ''),
                     'instance-id': instance_id,
+                    'segment-count': str(instance_attrs.get('segmentCount') or ''),
                 }
 
             # Upload to S3
@@ -662,9 +691,13 @@ class UnifiedETL:
         if not files:
             return 0
 
-        selected, stats = select_latest_daily_instance(files, processing_date)
+        selected, stats = select_latest_daily_instance(files, processing_date, only_final=True)
         logger.debug(f"      engagement/{app_id}: {stats['daily_files']} daily files, "
-                     f"{stats['rollup_files']} roll-ups skipped, {stats['dates']} dates")
+                     f"{stats['rollup_files']} roll-ups skipped, {stats['dates']} dates, "
+                     f"{stats['skipped_not_final']} dates kept (final copy not downloaded)")
+        if stats['skipped_not_final'] or stats.get('partial_files'):
+            logger.warning(f"   engagement/{app_id}: {stats['skipped_not_final']} dates kept as stored, "
+                           f"{stats.get('partial_files', 0)} files of incomplete instances ignored")
         if selected.empty:
             return 0
 
